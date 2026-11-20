@@ -176,7 +176,12 @@ class FakeDim {
     Queue.offerUnsafe(this.noticeQueue, notice);
   }
 
-  pushEvent(type: string, name: string, data: Record<string, unknown>): void {
+  pushEvent(
+    type: string,
+    name: string,
+    data: Record<string, unknown>,
+    parentCallId: string | null = null,
+  ): void {
     const sequence = this.nextEvent++;
     this.push({
       method: "session.event",
@@ -190,6 +195,7 @@ class FakeDim {
           type,
           name,
           data,
+          ...(parentCallId === null ? {} : { parent_call_id: parentCallId }),
         },
       },
     });
@@ -1823,6 +1829,94 @@ describe("DimAdapter turn content", () => {
         type: "image",
         source: { type: "base64", mediaType: "image/png", data: "iVBORw==" },
       });
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+});
+
+describe("DimAdapter Code Mode children", () => {
+  const dynamicToolOutput = (event: Event): string | undefined => {
+    if (event.type !== "turn_item.updated" || event.turnItem.type !== "dynamic_tool") {
+      return undefined;
+    }
+    return typeof event.turnItem.output === "string" ? event.turnItem.output : undefined;
+  };
+
+  it.effect("folds child tool calls and results into the parent tool's output", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      yield* harness.runtime.startTurn(turnInput(thread));
+      harness.fake.pushEvent("input", "applied", { input_id: "input-1", mode: "queue" });
+      harness.fake.pushEvent("turn", "start", { turn_id: "turn-1" });
+      harness.fake.pushEvent("step", "tool-use", {
+        turn_id: "turn-1",
+        call: { id: "call-parent", name: "codemode", input: { code: "return tools.read()" } },
+      });
+      const parent = yield* harness.waitFor(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "dynamic_tool" &&
+          event.turnItem.status === "running",
+      );
+      assert.strictEqual(
+        parent.type === "turn_item.updated" ? parent.turnItem.nativeItemRef?.nativeId : undefined,
+        "tool:call-parent",
+      );
+
+      harness.fake.pushEvent(
+        "step",
+        "tool-call",
+        {
+          turn_id: "turn-1",
+          request_id: "request-1",
+          calls: [{ id: "child-1", name: "read", input: { path: "/tmp/a" } }],
+        },
+        "call-parent",
+      );
+      const withCall = yield* harness.waitFor(
+        (event) => dynamicToolOutput(event)?.includes("→ read") ?? false,
+      );
+      assert.match(String(dynamicToolOutput(withCall)), /→ read \{"path":"\/tmp\/a"\}/u);
+
+      harness.fake.pushEvent(
+        "step",
+        "tool-result",
+        {
+          turn_id: "turn-1",
+          request_id: "request-1",
+          results: [{ call_id: "child-1", result: { content: "hello", isError: false } }],
+        },
+        "call-parent",
+      );
+      const withResult = yield* harness.waitFor(
+        (event) => dynamicToolOutput(event)?.includes("← read: hello") ?? false,
+      );
+      assert.match(
+        String(dynamicToolOutput(withResult)),
+        /→ read \{"path":"\/tmp\/a"\}\n← read: hello/u,
+      );
+
+      harness.fake.pushEvent("step", "tool-result", {
+        turn_id: "turn-1",
+        request_id: "request-1",
+        results: [{ call_id: "call-parent", result: { content: "done", isError: false } }],
+      });
+      const completed = yield* harness.waitFor(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "dynamic_tool" &&
+          event.turnItem.status === "completed",
+      );
+      assert.match(String(dynamicToolOutput(completed)), /← read: hello\ndone$/u);
+
+      const seen = yield* Ref.get(harness.events);
+      assert.isUndefined(
+        seen.find(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === "tool:child-1",
+        ),
+      );
     }).pipe(Effect.scoped, Effect.provide(layers)),
   );
 });

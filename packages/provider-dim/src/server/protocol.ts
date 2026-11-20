@@ -42,6 +42,8 @@ export interface DimSessionEvent {
     readonly type: string;
     readonly name: string;
     readonly data: unknown;
+    /** The outer call of a Code Mode child invocation; absent for the top level. */
+    readonly parentCallId: string | null;
   };
 }
 
@@ -165,7 +167,15 @@ export function parseDimEvent(event: unknown): DimSessionEvent["event"] | null {
   const createAt = recordNumber(event, "create_at");
   if (id === undefined || type === undefined || name === undefined) return null;
   if (sequence === undefined || createAt === undefined) return null;
-  return { id, sequence, create_at: createAt, type, name, data: event["data"] };
+  return {
+    id,
+    sequence,
+    create_at: createAt,
+    type,
+    name,
+    data: event["data"],
+    parentCallId: recordString(event, "parent_call_id") ?? null,
+  };
 }
 
 export function dimEvent(data: unknown): DimSessionEvent | null {
