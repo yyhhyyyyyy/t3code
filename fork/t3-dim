@@ -1,0 +1,1053 @@
+#!/bin/bash
+# t3-dim runs this fork's T3 Code server as a launchd agent on macOS, and keeps
+# it updated from origin/main. Run `t3-dim help`.
+#
+# Layout under $T3DIM_ROOT (default ~/.t3-dim):
+#   config            BASE_DIR, PORT, LAN; written once by install, never changed after
+#   repo/             private clone of the fork; releases are worktrees of it
+#   releases/<sha>/   one built checkout per version (deps + apps/server/dist)
+#   current           symlink to the running release
+#   state/previous    release to roll back to; state/staged the built-but-not-active one
+#   backups/          one APFS clone of statev2.sqlite* taken before each switch
+#   bin/              installed copy of this script and the launchd wrapper
+
+set -eu
+
+DEFAULT_PORT=3780
+FORK_URL="git@github.com:yyhhyyyyyy/t3code.git"
+UPSTREAM_URL="https://github.com/pingdotgg/t3code.git"
+# pnpm-workspace.yaml pins vite-plus to this version in its catalog.
+VITE_PLUS_VERSION="1.4.0"
+
+ROOT="${T3DIM_ROOT:-$HOME/.t3-dim}"
+LABEL="${T3DIM_LABEL:-com.t3dim.server}"
+PLIST_DIR="${T3DIM_PLIST_DIR:-$HOME/Library/LaunchAgents}"
+LOG_DIR="${T3DIM_LOG_DIR:-$HOME/Library/Logs/t3-dim}"
+REPO_URL="${T3DIM_REPO_URL:-$FORK_URL}"
+
+CONFIG="$ROOT/config"
+REPO="$ROOT/repo"
+RELEASES="$ROOT/releases"
+CURRENT="$ROOT/current"
+STATE="$ROOT/state"
+BACKUPS="$ROOT/backups"
+RUNNER="$ROOT/bin/run-server.sh"
+PLIST="$PLIST_DIR/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+JOB="$DOMAIN/$LABEL"
+
+HEALTH_TIMEOUT=300
+DIM_TIMEOUT=45
+
+log() { printf 't3-dim: %s\n' "$*"; }
+warn() { printf 't3-dim: warning: %s\n' "$*" >&2; }
+die() {
+  printf 't3-dim: error: %s\n' "$*" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------- config
+
+load_config() {
+  [ -f "$CONFIG" ] || die "not installed in $ROOT (run: t3-dim install)"
+  # shellcheck source=/dev/null
+  . "$CONFIG"
+  : "${BASE_DIR:?config is missing BASE_DIR}" "${PORT:?config is missing PORT}"
+  LAN="${LAN:-1}"
+}
+
+shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+write_config() {
+  mkdir -p "$ROOT"
+  {
+    printf 'BASE_DIR=%s\n' "$(shell_quote "$BASE_DIR")"
+    printf 'PORT=%s\n' "$PORT"
+    printf 'LAN=%s\n' "$LAN"
+    printf 'INSTALLED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >"$CONFIG.tmp"
+  mv -f "$CONFIG.tmp" "$CONFIG"
+}
+
+expand_path() {
+  case "$1" in
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
+    /*) printf '%s' "$1" ;;
+    *) printf '%s/%s' "$(pwd)" "$1" ;;
+  esac
+}
+
+current_name() {
+  local _target
+  [ -L "$CURRENT" ] || return 1
+  _target=$(readlink "$CURRENT")
+  printf '%s' "${_target##*/}"
+}
+
+# ---------------------------------------------------------------- probes
+
+# 0 = a running server holds the ownership lock, 1 = free, 2 = cannot tell.
+# The server keeps an exclusive transaction on server-owner.sqlite, so a
+# read-only read of sqlite_master is refused with SQLITE_BUSY only while it is
+# held. Same probe as apps/desktop/src/backend/DesktopHomeOwner.ts; a live PID
+# alone proves nothing, because PIDs are reused.
+base_dir_locked() {
+  local _lock _out
+  _lock="$1/userdata/server-owner.sqlite"
+  if [ ! -f "$_lock" ]; then return 1; fi
+  command -v sqlite3 >/dev/null 2>&1 || return 2
+  if _out=$(sqlite3 -readonly -cmd ".timeout 0" "$_lock" "SELECT count(*) FROM sqlite_master;" 2>&1); then
+    return 1
+  fi
+  case "$_out" in
+    *"database is locked"*) return 0 ;;
+  esac
+  return 2
+}
+
+ownership_advice() {
+  cat >&2 <<'EOF'
+t3-dim: the base directory is in use by a running T3 Code server.
+t3-dim: quit it first: Settings -> Environments -> This app -> Local environment.
+t3-dim: (or pass --base-dir to install somewhere else)
+EOF
+}
+
+# Prints the number of unfinished runs, or nothing when the schema is unreadable.
+active_runs() {
+  local _db
+  _db="$BASE_DIR/userdata/statev2.sqlite"
+  if [ ! -f "$_db" ]; then
+    printf '0'
+    return 0
+  fi
+  command -v sqlite3 >/dev/null 2>&1 || return 1
+  sqlite3 -readonly -cmd ".timeout 2000" "$_db" \
+    "SELECT count(*) FROM orchestration_v2_projection_runs WHERE status NOT IN ('completed','interrupted','failed','cancelled','rolled_back');" \
+    2>/dev/null | tr -d '[:space:]'
+}
+
+runtime_value() {
+  local _rt
+  _rt="$BASE_DIR/userdata/server-runtime.json"
+  [ -f "$_rt" ] || return 1
+  sed -n "s/.*\"$1\":[[:space:]]*\"\{0,1\}\([^,}\"]*\)\"\{0,1\}.*/\1/p" "$_rt" | head -1
+}
+
+descriptor() { curl -fsS --max-time 3 "http://127.0.0.1:$PORT/.well-known/t3/environment" 2>/dev/null; }
+
+server_healthy() {
+  local _pid
+  _pid=$(runtime_value pid) || return 1
+  [ -n "$_pid" ] || return 1
+  kill -0 "$_pid" 2>/dev/null || return 1
+  [ "$(runtime_value port)" = "$PORT" ] || return 1
+  descriptor >/dev/null || return 1
+}
+
+wait_server() {
+  local _i=0
+  local _n=$(( $1 * 2 ))
+  while [ "$_i" -lt "$_n" ]; do
+    if server_healthy; then return 0; fi
+    # A slow migration keeps the process alive; no pid means it crashed or
+    # launchd is only waiting out its throttle, so waiting longer is pointless.
+    if [ "$_i" -gt 6 ] && [ -z "$(agent_pid || true)" ]; then return 1; fi
+    sleep 0.5
+    _i=$((_i + 1))
+  done
+  return 1
+}
+
+dim_state() {
+  local _f _s
+  _f="$BASE_DIR/caches/dim.json"
+  if [ ! -f "$_f" ]; then
+    printf 'missing'
+    return 0
+  fi
+  _s=$(sed -n 's/^  "status": "\([a-z]*\)".*/\1/p' "$_f" | head -1)
+  printf '%s' "${_s:-unknown}"
+}
+
+dim_version() {
+  sed -n 's/^  "version": "\(.*\)".*/\1/p' "$BASE_DIR/caches/dim.json" 2>/dev/null | head -1
+}
+
+wait_dim() {
+  local _i=0
+  local _n=$(( $1 * 2 ))
+  while [ "$_i" -lt "$_n" ]; do
+    if [ "$(dim_state)" = "ready" ]; then return 0; fi
+    sleep 0.5
+    _i=$((_i + 1))
+  done
+  return 1
+}
+
+report_dim() {
+  if wait_dim "$DIM_TIMEOUT"; then
+    log "server is up; Dim provider ready ($(dim_version))"
+  else
+    warn "server is up but the Dim provider is $(dim_state); check the dima daemon (t3-dim status)"
+  fi
+}
+
+# ---------------------------------------------------------------- launchd
+
+agent_loaded() { launchctl print "$JOB" >/dev/null 2>&1; }
+
+agent_pid() { launchctl print "$JOB" 2>/dev/null | awk '$1 == "pid" && $2 == "=" { print $3; exit }'; }
+
+# Guards the signals below: a recycled pid must never be signalled.
+pid_is_ours() {
+  local _cmd
+  _cmd=$(ps -p "$1" -o command= 2>/dev/null || true)
+  case "$_cmd" in
+    *"$ROOT/bin/run-server.sh"*) return 0 ;;
+    *"$ROOT/current/apps/server/dist/bin.mjs"*) return 0 ;;
+  esac
+  return 1
+}
+
+stop_agent() {
+  local _pid _i
+  if ! agent_loaded; then return 0; fi
+  _pid=$(agent_pid)
+  launchctl bootout "$JOB" >/dev/null 2>&1 || true
+  _i=0
+  while agent_loaded && [ "$_i" -lt 40 ]; do
+    sleep 0.25
+    _i=$((_i + 1))
+  done
+  if [ -z "$_pid" ]; then return 0; fi
+  _i=0
+  while kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 60 ]; do
+    sleep 0.5
+    _i=$((_i + 1))
+  done
+  if ! kill -0 "$_pid" 2>/dev/null; then return 0; fi
+  if ! pid_is_ours "$_pid"; then
+    warn "pid $_pid no longer runs this server; not signalling it"
+    return 0
+  fi
+  warn "server pid $_pid did not exit; sending SIGTERM"
+  kill -TERM "$_pid" 2>/dev/null || true
+  _i=0
+  while kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 40 ]; do
+    sleep 0.5
+    _i=$((_i + 1))
+  done
+  if kill -0 "$_pid" 2>/dev/null && pid_is_ours "$_pid"; then
+    warn "server pid $_pid still alive; sending SIGKILL"
+    kill -KILL "$_pid" 2>/dev/null || true
+    sleep 1
+  fi
+  return 0
+}
+
+start_agent() {
+  local _out
+  [ -f "$PLIST" ] || die "missing launch agent file $PLIST"
+  if agent_loaded; then stop_agent; fi
+  if ! _out=$(launchctl bootstrap "$DOMAIN" "$PLIST" 2>&1); then
+    warn "launchctl bootstrap failed: $_out"
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- files
+
+tool_path() {
+  local _dirs _c _p _d
+  _dirs="$HOME/.local/bin"
+  for _c in node pnpm vp dima claude codex git; do
+    _p=$(command -v "$_c" 2>/dev/null || true)
+    if [ -n "$_p" ]; then
+      _d=$(dirname "$_p")
+      case ":$_dirs:" in
+        *":$_d:"*) ;;
+        *) _dirs="$_dirs:$_d" ;;
+      esac
+    fi
+  done
+  if [ -d "$HOME/.local/share/mise/shims" ]; then
+    case ":$_dirs:" in
+      *":$HOME/.local/share/mise/shims:"*) ;;
+      *) _dirs="$_dirs:$HOME/.local/share/mise/shims" ;;
+    esac
+  fi
+  printf '%s:/usr/bin:/bin:/usr/sbin:/sbin' "$_dirs"
+}
+
+# The terminal manager starts new terminals with env.SHELL, so the agent has to
+# carry the login shell explicitly; launchd does not know it.
+user_shell() {
+  local _s=""
+  if command -v dscl >/dev/null 2>&1; then
+    _s=$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | sed -n 's/^UserShell: //p')
+  fi
+  if [ -z "$_s" ]; then _s=${SHELL:-}; fi
+  if [ -z "$_s" ]; then _s=/bin/zsh; fi
+  printf '%s' "$_s"
+}
+
+plist_escape() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+
+write_runner() {
+  mkdir -p "$ROOT/bin"
+  cat >"$RUNNER.tmp" <<EOF
+#!/bin/sh
+# Generated by t3-dim; launchd runs this. It reads the config and the current
+# symlink on every start, so switching releases needs no plist change.
+set -eu
+ROOT="$ROOT"
+. "\$ROOT/config"
+if ! command -v node >/dev/null 2>&1; then
+  echo "t3-dim: node is not on PATH (PATH=\$PATH)" >&2
+  exit 127
+fi
+# Another server owns the base dir: exit 0 so KeepAlive does not respawn in a loop.
+# Read-only probe, same as the t3-dim script: SQLITE_BUSY means the lock is held.
+if [ -f "\$BASE_DIR/userdata/server-owner.sqlite" ] && command -v sqlite3 >/dev/null 2>&1; then
+  _probe=\$(sqlite3 -readonly -cmd ".timeout 0" "\$BASE_DIR/userdata/server-owner.sqlite" "SELECT count(*) FROM sqlite_master;" 2>&1) || {
+    case "\$_probe" in
+      *"database is locked"*)
+        echo "t3-dim: \$BASE_DIR is owned by another running server; not starting (run: t3-dim status)"
+        exit 0
+        ;;
+    esac
+  }
+fi
+LAN_ARG=""
+if [ "\${LAN:-1}" = "1" ]; then LAN_ARG="--lan"; fi
+echo "t3-dim: \$(date -u +%Y-%m-%dT%H:%M:%SZ) starting \$(readlink "\$ROOT/current")"
+# shellcheck disable=SC2086 # LAN_ARG is one optional flag.
+exec node "\$ROOT/current/apps/server/dist/bin.mjs" --base-dir "\$BASE_DIR" --port "\$PORT" --no-browser \$LAN_ARG
+EOF
+  chmod +x "$RUNNER.tmp"
+  mv -f "$RUNNER.tmp" "$RUNNER"
+}
+
+write_plist() {
+  local _path _root _runner _out _err _home _shell _lang
+  mkdir -p "$PLIST_DIR" || die "cannot create $PLIST_DIR"
+  _path=$(plist_escape "$(tool_path)")
+  _root=$(plist_escape "$ROOT")
+  _runner=$(plist_escape "$RUNNER")
+  _out=$(plist_escape "$LOG_DIR/server.out.log")
+  _err=$(plist_escape "$LOG_DIR/server.err.log")
+  _home=$(plist_escape "$HOME")
+  _shell=$(plist_escape "$(user_shell)")
+  _lang=$(plist_escape "${LANG:-en_US.UTF-8}")
+  cat >"$PLIST.tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>$_runner</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>WorkingDirectory</key>
+  <string>$_root</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$_path</string>
+    <key>HOME</key>
+    <string>$_home</string>
+    <key>SHELL</key>
+    <string>$_shell</string>
+    <key>LANG</key>
+    <string>$_lang</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>$_out</string>
+  <key>StandardErrorPath</key>
+  <string>$_err</string>
+</dict>
+</plist>
+EOF
+  if ! plutil -lint "$PLIST.tmp" >/dev/null; then
+    rm -f "$PLIST.tmp"
+    die "generated launch agent plist did not validate"
+  fi
+  mv -f "$PLIST.tmp" "$PLIST"
+}
+
+install_self() {
+  local _src
+  mkdir -p "$ROOT/bin"
+  _src="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  if [ ! -f "$_src" ]; then return 0; fi
+  if [ "$_src" = "$ROOT/bin/t3-dim" ]; then return 0; fi
+  if cmp -s "$_src" "$ROOT/bin/t3-dim"; then return 0; fi
+  cp "$_src" "$ROOT/bin/t3-dim.tmp"
+  chmod +x "$ROOT/bin/t3-dim.tmp"
+  mv -f "$ROOT/bin/t3-dim.tmp" "$ROOT/bin/t3-dim"
+  log "installed $ROOT/bin/t3-dim"
+}
+
+self_update_from() {
+  local _src
+  _src="$RELEASES/$1/fork/t3-dim"
+  if [ ! -f "$_src" ]; then return 0; fi
+  if [ ! -f "$ROOT/bin/t3-dim" ]; then return 0; fi
+  if cmp -s "$_src" "$ROOT/bin/t3-dim"; then return 0; fi
+  cp "$_src" "$ROOT/bin/t3-dim.tmp"
+  chmod +x "$ROOT/bin/t3-dim.tmp"
+  mv -f "$ROOT/bin/t3-dim.tmp" "$ROOT/bin/t3-dim"
+  log "updated the t3-dim script from release $1"
+}
+
+# ---------------------------------------------------------------- repo + releases
+
+ensure_repo() {
+  mkdir -p "$LOG_DIR"
+  if [ -d "$REPO/.git" ]; then
+    git -C "$REPO" fetch --prune origin >>"$LOG_DIR/git.log" 2>&1 ||
+      die "git fetch failed (see $LOG_DIR/git.log)"
+  else
+    log "cloning $REPO_URL into $REPO"
+    git clone "$REPO_URL" "$REPO" >>"$LOG_DIR/git.log" 2>&1 ||
+      die "git clone failed (see $LOG_DIR/git.log)"
+  fi
+}
+
+# Builds $1 (a sha) into releases/<name>; sets RELEASE_NAME. Returns 1 on failure.
+RELEASE_NAME=""
+build_release() {
+  local _sha _name _dir _log
+  _sha=$1
+  RELEASE_NAME=""
+  _name=$(git -C "$REPO" rev-parse --short=12 "$_sha" 2>/dev/null) || {
+    warn "unknown revision $_sha"
+    return 1
+  }
+  _dir="$RELEASES/$_name"
+  _log="$LOG_DIR/build-$_name.log"
+  if [ -f "$_dir/apps/server/dist/bin.mjs" ]; then
+    log "release $_name is already built"
+    RELEASE_NAME=$_name
+    return 0
+  fi
+  log "building release $_name (log: $_log)"
+  mkdir -p "$RELEASES" "$LOG_DIR"
+  if [ -e "$_dir" ]; then
+    git -C "$REPO" worktree remove --force "$_dir" >/dev/null 2>&1 || rm -rf "$_dir"
+    git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+  fi
+  if ! {
+    echo "== t3-dim build $_name ($_sha) at $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
+    git -C "$REPO" worktree add --detach "$_dir" "$_sha" &&
+      (cd "$_dir" && vp i --frozen-lockfile -- --yes) &&
+      (cd "$_dir" && ./node_modules/.bin/vp run --filter t3 build:bundle)
+  } >>"$_log" 2>&1; then
+    warn "build of $_name failed; last lines of $_log:"
+    tail -n 25 "$_log" >&2 || true
+    return 1
+  fi
+  if [ ! -f "$_dir/apps/server/dist/bin.mjs" ]; then
+    warn "build of $_name produced no apps/server/dist/bin.mjs (see $_log)"
+    return 1
+  fi
+  RELEASE_NAME=$_name
+  return 0
+}
+
+point_current() {
+  [ -f "$RELEASES/$1/apps/server/dist/bin.mjs" ] || return 1
+  rm -f "$CURRENT"
+  ln -s "$RELEASES/$1" "$CURRENT"
+}
+
+# Base name shared by the last database backup's files, empty when none exists.
+LAST_BACKUP=""
+backup_db() {
+  local _from _dir _ts _suf _stage
+  _from=$1
+  LAST_BACKUP=""
+  _dir="$BASE_DIR/userdata"
+  if [ ! -f "$_dir/statev2.sqlite" ]; then
+    log "no statev2.sqlite in $_dir yet; nothing to back up"
+    return 0
+  fi
+  mkdir -p "$BACKUPS"
+  _ts=$(date +%Y%m%d-%H%M%S)
+  # Stage under .part.* and only then replace the previous backup, so a failed
+  # copy never leaves the only backup half written.
+  rm -f "$BACKUPS"/.part.*
+  for _suf in "" "-wal" "-shm"; do
+    if [ ! -f "$_dir/statev2.sqlite$_suf" ]; then continue; fi
+    _stage="$BACKUPS/.part.statev2-$_from-$_ts.sqlite$_suf"
+    if ! cp -c "$_dir/statev2.sqlite$_suf" "$_stage" 2>/dev/null; then
+      warn "cp -c failed for statev2.sqlite$_suf; copying instead"
+      if ! cp "$_dir/statev2.sqlite$_suf" "$_stage"; then
+        rm -f "$BACKUPS"/.part.*
+        return 1
+      fi
+    fi
+  done
+  rm -f "$BACKUPS"/statev2-*.sqlite*
+  for _suf in "" "-wal" "-shm"; do
+    _stage="$BACKUPS/.part.statev2-$_from-$_ts.sqlite$_suf"
+    if [ -f "$_stage" ]; then mv -f "$_stage" "$BACKUPS/statev2-$_from-$_ts.sqlite$_suf"; fi
+  done
+  LAST_BACKUP="$BACKUPS/statev2-$_from-$_ts.sqlite"
+  log "backed up statev2.sqlite* to $LAST_BACKUP"
+}
+
+# Puts the statev2.sqlite* files from backup $1 (a path ending in .sqlite) back,
+# dropping any file the backup does not have. Used only by the automatic
+# rollback after a failed switch: the server is stopped, so nothing is lost.
+restore_db() {
+  local _base _dir _suf _dst
+  _base=$1
+  [ -f "$_base" ] || return 1
+  _dir="$BASE_DIR/userdata"
+  for _suf in "" "-wal" "-shm"; do
+    _dst="$_dir/statev2.sqlite$_suf"
+    if [ -f "$_base$_suf" ]; then
+      rm -f "$_dst"
+      if ! cp -c "$_base$_suf" "$_dst" 2>/dev/null; then
+        cp "$_base$_suf" "$_dst" || return 1
+      fi
+    else
+      rm -f "$_dst"
+    fi
+  done
+  return 0
+}
+
+# Stops the server, backs up the database, activates release $1, health checks,
+# and rolls back to the previous release if the new one does not come up.
+switch_release() {
+  local _new _old
+  _new=$1
+  LAST_BACKUP=""
+  load_config
+  [ -f "$RELEASES/$_new/apps/server/dist/bin.mjs" ] || die "release $_new is not built"
+  _old=$(current_name || true)
+  if [ "$_old" = "$_new" ]; then
+    log "release $_new is already active"
+    return 0
+  fi
+  log "stopping server"
+  stop_agent
+  if ! backup_db "${_old:-unknown}"; then
+    warn "database backup failed; not switching"
+    if [ -n "$_old" ] && start_agent && wait_server "$HEALTH_TIMEOUT"; then
+      log "restored release $_old"
+    else
+      warn "server is stopped; fix $BACKUPS and run t3-dim restart"
+    fi
+    return 1
+  fi
+  log "activating release $_new"
+  point_current "$_new" || die "cannot point $CURRENT at $_new"
+  if ! start_agent || ! wait_server "$HEALTH_TIMEOUT"; then
+    warn "release $_new did not come up; rolling back"
+    stop_agent
+    rm -f "$STATE/staged"
+    if [ -z "$_old" ]; then
+      warn "no previous release to restore; the server stays stopped (see $LOG_DIR)"
+      return 1
+    fi
+    # The failed release may have migrated or written the database before it
+    # died, so the old release gets the pre-switch clone back, not the live file.
+    if [ -n "$LAST_BACKUP" ] && ! restore_db "$LAST_BACKUP"; then
+      point_current "$_old"
+      warn "could not restore the database from $LAST_BACKUP"
+      warn "current points at $_old again, and the server stays stopped"
+      warn "restore statev2.sqlite* from that backup, then run t3-dim restart"
+      return 1
+    fi
+    if point_current "$_old" && start_agent && wait_server "$HEALTH_TIMEOUT"; then
+      log "restored release $_old"
+      if [ -n "$LAST_BACKUP" ]; then log "database restored from $LAST_BACKUP"; fi
+    else
+      warn "could not restore the previous release (see $LOG_DIR)"
+    fi
+    return 1
+  fi
+  if [ -n "$_old" ]; then
+    printf '%s\n' "$_old" >"$STATE/previous"
+  fi
+  rm -f "$STATE/staged"
+  report_dim
+  self_update_from "$_new"
+  return 0
+}
+
+cleanup_releases() {
+  local _keep_current _keep_previous _dir _name
+  _keep_current=$(current_name || true)
+  _keep_previous=$(cat "$STATE/previous" 2>/dev/null || true)
+  for _dir in "$RELEASES"/*; do
+    [ -d "$_dir" ] || continue
+    _name=${_dir##*/}
+    if [ "$_name" = "$_keep_current" ]; then continue; fi
+    if [ "$_name" = "$_keep_previous" ]; then continue; fi
+    log "removing old release $_name"
+    git -C "$REPO" worktree remove --force "$_dir" >/dev/null 2>&1 || rm -rf "$_dir"
+  done
+  git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------- commands
+
+need_build_tools() {
+  local _missing _c _vp
+  _missing=""
+  for _c in node pnpm vp git; do
+    if ! command -v "$_c" >/dev/null 2>&1; then _missing="$_missing $_c"; fi
+  done
+  if [ -n "$_missing" ]; then
+    cat >&2 <<EOF
+t3-dim: missing tools:$_missing
+t3-dim: install them, then rerun:
+  mise use -g node@lts
+  npm install -g pnpm vite-plus@$VITE_PLUS_VERSION
+EOF
+    exit 1
+  fi
+  _vp=$(vp --version 2>/dev/null | head -1 || true)
+  case "$_vp" in
+    *"$VITE_PLUS_VERSION"*) ;;
+    *) warn "vp reports '$_vp'; this repo pins vite-plus $VITE_PLUS_VERSION" ;;
+  esac
+}
+
+cmd_install() {
+  local _base _port _sha _name _locked _cur _agent _owner
+  _base=""
+  _port=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base-dir)
+        [ $# -ge 2 ] || die "--base-dir needs a value"
+        _base=$2
+        shift 2
+        ;;
+      --port)
+        [ $# -ge 2 ] || die "--port needs a value"
+        _port=$2
+        shift 2
+        ;;
+      *) die "install: unknown argument $1" ;;
+    esac
+  done
+  [ "$(uname -s)" = "Darwin" ] || die "t3-dim runs on macOS only"
+  need_build_tools
+  if [ -f "$CONFIG" ]; then
+    load_config
+    if [ -n "$_base" ] && [ "$(expand_path "$_base")" != "$BASE_DIR" ]; then
+      die "already installed with BASE_DIR=$BASE_DIR; changing it would invalidate every paired device"
+    fi
+    if [ -n "$_port" ] && [ "$_port" != "$PORT" ]; then
+      die "already installed with PORT=$PORT; changing it would invalidate every paired device"
+    fi
+  else
+    BASE_DIR=$(expand_path "${_base:-$HOME/.t3}")
+    PORT="${_port:-$DEFAULT_PORT}"
+    LAN=1
+  fi
+  case "$PORT" in
+    *[!0-9]*) die "--port must be a number" ;;
+  esac
+  if [ "$PORT" -lt 1024 ] || [ "$PORT" -gt 65535 ]; then
+    die "--port must be between 1024 and 65535"
+  fi
+  if [ "$PORT" = "3773" ]; then
+    warn "port 3773 is the official app's default; one of the two servers will stay down"
+  fi
+
+  _locked=0
+  base_dir_locked "$BASE_DIR" || _locked=$?
+  if [ "$_locked" = "0" ]; then
+    _agent=$(agent_pid || true)
+    _owner=$(runtime_value pid || true)
+    if [ -n "$_agent" ] && [ "$_agent" = "$_owner" ]; then
+      log "this base dir belongs to the installed agent; it will be restarted"
+    else
+      ownership_advice
+      exit 1
+    fi
+  elif [ "$_locked" = "2" ]; then
+    warn "cannot probe $BASE_DIR for a running server; continuing"
+  fi
+
+  mkdir -p "$ROOT" "$RELEASES" "$STATE" "$BACKUPS" "$ROOT/bin" "$LOG_DIR"
+  write_config
+  log "base dir: $BASE_DIR"
+  log "port:     $PORT"
+
+  ensure_repo
+  _sha=$(git -C "$REPO" rev-parse origin/main)
+  if ! build_release "$_sha"; then
+    die "could not build origin/main; fix the build and rerun t3-dim install"
+  fi
+  _name=$RELEASE_NAME
+
+  write_runner
+  write_plist
+  install_self
+  _cur=$(current_name || true)
+  if [ -n "$_cur" ] && [ "$_cur" != "$_name" ]; then
+    switch_release "$_name" || die "could not activate $_name (see $LOG_DIR)"
+  else
+    if agent_loaded; then stop_agent; fi
+    point_current "$_name" || die "cannot point $CURRENT at $_name"
+    if [ -z "$_cur" ]; then rm -f "$STATE/previous" "$STATE/staged"; fi
+    start_agent || die "launchctl could not load $PLIST"
+    if ! wait_server "$HEALTH_TIMEOUT"; then
+      warn "the server did not become healthy; logs: $LOG_DIR"
+      tail -n 20 "$LOG_DIR/server.err.log" 2>/dev/null >&2 || true
+      exit 1
+    fi
+    report_dim
+  fi
+  log "installed as launch agent $LABEL (release $_name)"
+  printf '\nNext: %s pair\n' "$ROOT/bin/t3-dim"
+  printf 'Tip:  add %s to PATH so t3-dim works everywhere.\n' "$ROOT/bin"
+}
+
+cmd_update() {
+  local _now _sha _name _cur _runs
+  _now=0
+  if [ "${1:-}" = "--now" ]; then _now=1; fi
+  load_config
+  [ -d "$REPO/.git" ] || die "no clone in $REPO; run t3-dim install"
+  ensure_repo
+  _sha=$(git -C "$REPO" rev-parse origin/main)
+  _name=$(git -C "$REPO" rev-parse --short=12 origin/main)
+  _cur=$(current_name || true)
+  if [ "$_name" = "$_cur" ]; then
+    log "already up to date ($_name)"
+    exit 0
+  fi
+  log "origin/main is at $_name (current: ${_cur:-none})"
+  if ! build_release "$_sha"; then
+    die "build failed; release ${_cur:-none} keeps running"
+  fi
+  _name=$RELEASE_NAME
+  # A stopped agent has nothing to interrupt, and its database has no -shm for
+  # the read-only probe, so switching is safe.
+  if [ "$_now" = "0" ] && ! agent_loaded; then
+    _now=1
+  fi
+  if [ "$_now" = "0" ]; then
+    _runs=$(active_runs || true)
+    if [ -z "$_runs" ]; then
+      warn "cannot tell whether agent turns are running (statev2.sqlite unreadable); staging only"
+      _now=0
+    elif [ "$_runs" -gt 0 ]; then
+      log "$_runs unfinished run(s) found; not restarting the server now"
+      _now=0
+    else
+      _now=1
+    fi
+    if [ "$_now" = "0" ]; then
+      mkdir -p "$STATE"
+      printf '%s\n' "$_name" >"$STATE/staged"
+      log "release $_name is built and staged"
+      log "run 't3-dim restart' when no agent turn is running to activate it"
+      exit 0
+    fi
+  fi
+  switch_release "$_name" || die "update failed; see $LOG_DIR"
+  cleanup_releases
+  log "updated to $_name"
+}
+
+# Gate for every command that stops the server: --now forces it, otherwise it
+# refuses while any agent run is unfinished or that state cannot be read.
+# A stopped agent has nothing to interrupt, and its database has no -shm for the
+# read-only probe, so it always passes.
+require_idle() {
+  local _cmd=$1 _now=$2 _runs
+  if [ "$_now" = "1" ]; then return 0; fi
+  if ! agent_loaded; then return 0; fi
+  _runs=$(active_runs || true)
+  if [ -z "$_runs" ]; then
+    die "cannot tell whether agent runs are active (statev2.sqlite unreadable); rerun with --now to $_cmd anyway"
+  fi
+  if [ "$_runs" -gt 0 ]; then
+    die "$_runs unfinished agent run(s) would be interrupted; wait for them, or rerun with --now to $_cmd anyway"
+  fi
+  return 0
+}
+
+cmd_restart() {
+  local _staged _cur _out _now
+  _now=0
+  case "${1:-}" in
+    "") ;;
+    --now) _now=1 ;;
+    *) die "restart: unknown argument $1" ;;
+  esac
+  load_config
+  require_idle restart "$_now"
+  _staged=$(cat "$STATE/staged" 2>/dev/null || true)
+  if [ -n "$_staged" ]; then
+    _cur=$(current_name || true)
+    if [ "$_staged" != "$_cur" ]; then
+      log "activating staged release $_staged"
+      switch_release "$_staged" || die "restart failed; see $LOG_DIR"
+      cleanup_releases
+      return 0
+    fi
+    rm -f "$STATE/staged"
+  fi
+  agent_loaded || die "launch agent $LABEL is not loaded; run t3-dim install"
+  log "restarting release $(current_name || echo unknown)"
+  if ! _out=$(launchctl kickstart -k "$JOB" 2>&1); then
+    die "launchctl kickstart failed: $_out"
+  fi
+  wait_server "$HEALTH_TIMEOUT" || die "restarted server did not become healthy; see $LOG_DIR"
+  report_dim
+}
+
+cmd_rollback() {
+  local _prev _now
+  _now=0
+  case "${1:-}" in
+    "") ;;
+    --now) _now=1 ;;
+    *) die "rollback: unknown argument $1" ;;
+  esac
+  load_config
+  require_idle rollback "$_now"
+  _prev=$(cat "$STATE/previous" 2>/dev/null || true)
+  [ -n "$_prev" ] || die "no previous release recorded"
+  [ -f "$RELEASES/$_prev/apps/server/dist/bin.mjs" ] ||
+    die "previous release $_prev is not built anymore"
+  warn "rolling back to $_prev"
+  warn "the database has been migrated forward since; an older server may not read it"
+  warn "statev2.sqlite* is backed up before the switch in $BACKUPS"
+  switch_release "$_prev" || die "rollback failed; see $LOG_DIR"
+  log "rolled back to $_prev"
+}
+
+cmd_status() {
+  local _lan _body _dim _v _tail
+  load_config
+  printf 'agent:    '
+  if agent_loaded; then
+    printf 'loaded (pid %s)\n' "$(agent_pid || echo '?')"
+  else
+    printf 'not loaded\n'
+  fi
+  printf 'release:  %s\n' "$(current_name || echo none)"
+  if [ -f "$STATE/staged" ]; then printf 'staged:   %s\n' "$(cat "$STATE/staged")"; fi
+  if [ -f "$STATE/previous" ]; then printf 'previous: %s\n' "$(cat "$STATE/previous")"; fi
+  printf 'base dir: %s\n' "$BASE_DIR"
+  _lan=""
+  if [ "$LAN" = "1" ]; then _lan=" (LAN)"; fi
+  printf 'port:     %s%s\n' "$PORT" "$_lan"
+  _body=$(descriptor || true)
+  if [ -n "$_body" ]; then
+    printf 'server:   healthy, version %s, origin %s\n' \
+      "$(printf '%s' "$_body" | sed -n 's/.*"serverVersion":"\([^"]*\)".*/\1/p')" \
+      "$(runtime_value origin || echo '?')"
+  else
+    printf 'server:   unreachable on 127.0.0.1:%s\n' "$PORT"
+    _tail=""
+    if [ -f "$LOG_DIR/server.err.log" ]; then
+      _tail=$(tail -n 1 "$LOG_DIR/server.err.log" 2>/dev/null || true)
+    fi
+    if [ -n "$_tail" ]; then printf 'last log: %s\n' "$_tail"; fi
+    exit 1
+  fi
+  _dim="$(dim_state)"
+  _v=$(dim_version)
+  if [ -n "$_v" ]; then
+    printf 'dim:      %s (version %s)\n' "$_dim" "$_v"
+  else
+    printf 'dim:      %s\n' "$_dim"
+  fi
+  printf 'logs:     %s\n' "$LOG_DIR"
+  printf 'launchd:  %s\n' "$PLIST"
+}
+
+cmd_logs() {
+  mkdir -p "$LOG_DIR"
+  if [ "${1:-}" = "-f" ]; then
+    exec tail -n 20 -f "$LOG_DIR/server.out.log" "$LOG_DIR/server.err.log"
+  fi
+  ls -1 "$LOG_DIR"
+  printf '\n--- server.out.log ---\n'
+  tail -n 40 "$LOG_DIR/server.out.log" 2>/dev/null || true
+  printf '\n--- server.err.log ---\n'
+  tail -n 40 "$LOG_DIR/server.err.log" 2>/dev/null || true
+}
+
+cmd_pair() {
+  local _bin
+  load_config
+  _bin="$CURRENT/apps/server/dist/bin.mjs"
+  [ -f "$_bin" ] || die "no built release; run t3-dim install"
+  if ! server_healthy; then
+    warn "the server does not look healthy; pair may fail"
+  fi
+  exec node "$_bin" pair --base-dir "$BASE_DIR" "$@"
+}
+
+cmd_uninstall() {
+  local _purge
+  _purge=0
+  if [ "${1:-}" = "--purge" ]; then _purge=1; fi
+  if [ -f "$CONFIG" ]; then load_config; fi
+  stop_agent
+  if agent_loaded; then
+    warn "launch agent $LABEL is still loaded; bootout it manually: launchctl bootout $JOB"
+  fi
+  if [ -f "$PLIST" ]; then
+    rm -f "$PLIST"
+    log "removed $PLIST"
+  fi
+  if [ "$_purge" = "1" ]; then
+    if [ -d "$REPO" ]; then git -C "$REPO" worktree prune >/dev/null 2>&1 || true; fi
+    rm -rf "$RELEASES" "$REPO" "$BACKUPS"
+    rm -f "$CURRENT" "$STATE/previous" "$STATE/staged"
+    log "removed releases, clone and backups"
+  fi
+  log "launch agent $LABEL is unloaded; data in ${BASE_DIR:-the base dir} is untouched"
+  if [ "$_purge" = "0" ]; then
+    log "config, releases in $RELEASES and logs in $LOG_DIR are kept (--purge drops releases)"
+  fi
+}
+
+cmd_sync() {
+  local _dry _log _conflicts _merge_failed
+  _dry=0
+  if [ "${1:-}" = "--dry-run" ]; then _dry=1; fi
+  [ -d "$REPO/.git" ] || die "no clone in $REPO; run t3-dim install"
+  mkdir -p "$LOG_DIR"
+  _log="$LOG_DIR/sync-$(date +%Y%m%d-%H%M%S).log"
+  if ! git -C "$REPO" remote get-url upstream >/dev/null 2>&1; then
+    git -C "$REPO" remote add upstream "$UPSTREAM_URL"
+  fi
+  {
+    echo "== t3-dim sync (dry-run=$_dry) at $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
+    git -C "$REPO" fetch --prune origin
+    git -C "$REPO" fetch --prune upstream
+  } >>"$_log" 2>&1 || die "git fetch failed (see $_log)"
+
+  if git -C "$REPO" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    warn "an earlier merge is still in progress in $REPO; aborting it"
+    git -C "$REPO" merge --abort >>"$_log" 2>&1 || true
+  fi
+  git -C "$REPO" switch --detach origin/main >>"$_log" 2>&1 || die "cannot check out origin/main (see $_log)"
+  _merge_failed=0
+  if ! git -C "$REPO" merge --no-ff --no-commit upstream/main >>"$_log" 2>&1; then
+    _merge_failed=1
+  fi
+  _conflicts=$(git -C "$REPO" diff --name-only --diff-filter=U)
+  if [ -n "$_conflicts" ]; then
+    git -C "$REPO" merge --abort >>"$_log" 2>&1 || true
+    warn "upstream/main conflicts with origin/main; nothing was pushed"
+    printf 'conflicted files:\n%s\n' "$_conflicts" >&2
+    exit 1
+  fi
+  if [ "$_merge_failed" = "1" ]; then
+    git -C "$REPO" merge --abort >>"$_log" 2>&1 || true
+    warn "upstream/main did not merge; nothing was pushed (see $_log)"
+    tail -n 20 "$_log" >&2 || true
+    exit 1
+  fi
+  if ! git -C "$REPO" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    log "upstream/main is already merged into origin/main"
+    exit 0
+  fi
+
+  log "upstream/main merged in $REPO; installing dependencies and running Dim checks"
+  if ! {
+    (cd "$REPO" && vp i --frozen-lockfile -- --yes) &&
+      (cd "$REPO" && ./node_modules/.bin/vp run --filter @t3tools/provider-dim typecheck) &&
+      (cd "$REPO" && ./node_modules/.bin/vp run --filter t3 typecheck) &&
+      (cd "$REPO" && ./node_modules/.bin/vp test run \
+        packages/provider-dim \
+        apps/server/src/orchestration-v2/testkit/DimReplayFixtures.integration.test.ts \
+        apps/server/src/provider/DimSessionManagement.test.ts)
+  } >>"$_log" 2>&1; then
+    git -C "$REPO" merge --abort >>"$_log" 2>&1 || true
+    warn "typecheck or Dim tests failed; nothing was pushed (see $_log)"
+    tail -n 30 "$_log" >&2 || true
+    exit 1
+  fi
+  if [ "$_dry" = "1" ]; then
+    git -C "$REPO" merge --abort >>"$_log" 2>&1 || true
+    log "dry run passed: the merge is clean and dim/server checks pass; not pushed"
+    exit 0
+  fi
+  git -C "$REPO" commit -m "Merge upstream/main" >>"$_log" 2>&1 || die "cannot commit the merge (see $_log)"
+  if ! git -C "$REPO" push origin HEAD:main >>"$_log" 2>&1; then
+    warn "push to origin/main failed; the merge commit stays in $REPO (see $_log)"
+    exit 1
+  fi
+  log "pushed the merge to origin/main ($(git -C "$REPO" rev-parse --short=12 HEAD))"
+  log "run t3-dim update to build and activate it"
+}
+
+cmd_help() {
+  cat <<EOF
+t3-dim — run this fork's T3 Code server as a background launchd agent on macOS.
+
+  t3-dim install [--base-dir DIR] [--port N]   first install: config, clone, build, launch agent
+  t3-dim update [--now]                        build origin/main; switch when idle (--now: switch now)
+  t3-dim restart [--now]                       start the staged release, or restart the current one
+  t3-dim rollback [--now]                      go back to the previous release (database schema risk)
+  t3-dim status                                agent, release, server health and Dim provider state
+  t3-dim logs [-f]                             tail the server logs (or follow them)
+  t3-dim pair                                  mint a pairing link for this server
+  t3-dim sync [--dry-run]                      merge upstream/main, run checks, push to origin/main
+  t3-dim uninstall [--purge]                   unload the agent (--purge also drops releases and clone)
+  t3-dim help                                  this text
+
+Environment overrides (mostly for tests):
+  T3DIM_ROOT        data root (default ~/.t3-dim)
+  T3DIM_LABEL       launchd label (default com.t3dim.server)
+  T3DIM_PLIST_DIR   launch agent directory (default ~/Library/LaunchAgents)
+  T3DIM_LOG_DIR     log directory (default ~/Library/Logs/t3-dim)
+  T3DIM_REPO_URL    clone URL (default $FORK_URL)
+EOF
+}
+
+main() {
+  local _cmd
+  _cmd=${1:-help}
+  if [ $# -gt 0 ]; then shift; fi
+  case "$_cmd" in
+    install) cmd_install "$@" ;;
+    update) cmd_update "$@" ;;
+    restart) cmd_restart "$@" ;;
+    rollback) cmd_rollback "$@" ;;
+    status) cmd_status "$@" ;;
+    logs) cmd_logs "$@" ;;
+    pair) cmd_pair "$@" ;;
+    sync) cmd_sync "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    help | -h | --help) cmd_help ;;
+    *) die "unknown command '$_cmd'; run: t3-dim help" ;;
+  esac
+}
+
+main "$@"
