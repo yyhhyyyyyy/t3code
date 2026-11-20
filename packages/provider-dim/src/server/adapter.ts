@@ -179,6 +179,7 @@ const DIM_CAPABILITIES: OrchestrationV2ProviderCapabilities = {
 };
 
 const isProviderAdapterProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
+const encodeJsonValue = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const STREAM_FLUSH_MS = 50;
 const DIM_MCP_LEASE_RENEW = "15 seconds";
@@ -189,6 +190,8 @@ const DIM_SKILLS_TIMEOUT = "3 seconds";
 const DIM_MAX_SEEN_EVENT_IDS = 2_048;
 // The daemon refuses a frame above 16 MiB, and every base64 image rides in one submit frame.
 const DIM_SUBMIT_IMAGE_BASE64_BUDGET = 12 * 1024 * 1024;
+const DIM_MAX_CHILD_ACTIVITY_LINES = 50;
+const DIM_MAX_CHILD_ACTIVITY_CHARS = 300;
 
 export type DimConnectionFactoryError = DimConnectionError | DimDaemonError;
 
@@ -214,6 +217,8 @@ interface ToolItemState {
   output?: string;
   structured?: unknown;
   taskId?: string;
+  /** Code Mode children this call ran, folded into the row's output. */
+  readonly childActivity: string[];
 }
 
 interface ActiveDimTurn {
@@ -234,6 +239,8 @@ interface ActiveDimTurn {
   /** The last live text/thinking each request reported before its `step/*` commit. */
   readonly progressByRequest: Map<string, DimProgressSnapshot>;
   readonly toolItems: Map<string, ToolItemState>;
+  /** Child call id to tool name, so a child result can name the call it settles. */
+  readonly childCallNames: Map<string, string>;
   readonly steers: Map<
     string,
     { messageId: MessageId; inputEventId: string | null; done: boolean }
@@ -312,6 +319,13 @@ function dimSelection(selection: ModelSelection): {
     model: parsed === null ? null : { provider: parsed.providerId, modelId: parsed.modelId },
     effort: typeof effort === "string" && effort !== "default" ? effort : null,
   };
+}
+
+/** One line of Code Mode child activity, bounded so a busy program cannot flood the row. */
+function dimChildActivityLine(line: string): string {
+  return line.length <= DIM_MAX_CHILD_ACTIVITY_CHARS
+    ? line
+    : `${line.slice(0, DIM_MAX_CHILD_ACTIVITY_CHARS - 1)}…`;
 }
 
 const dimBase64Length = (bytes: number): number => Math.ceil(bytes / 3) * 4;
@@ -757,6 +771,11 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           title: tool.name,
           completedAt,
         };
+        // Code Mode children have no row of their own, so their calls read in the parent's output.
+        const output =
+          tool.childActivity.length === 0
+            ? tool.output
+            : [tool.childActivity.join("\n"), tool.output].filter(Boolean).join("\n");
         if (kind === "command_execution") {
           const input = tool.input["command"];
           yield* emit({
@@ -766,7 +785,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
               ...base,
               type: "command_execution",
               input: typeof input === "string" ? input : "",
-              ...(tool.output === undefined ? {} : { output: tool.output }),
+              ...(output === undefined ? {} : { output }),
               ...(tool.status === "failed" ? { outputIndicatesFailure: true } : {}),
             },
           });
@@ -797,7 +816,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
             type: "dynamic_tool",
             toolName: tool.name,
             input: tool.input,
-            ...(tool.output === undefined ? {} : { output: tool.output }),
+            ...(output === undefined ? {} : { output }),
           },
         });
       });
@@ -1050,6 +1069,46 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
         });
       });
 
+      /**
+       * A Code Mode child invocation reports only its own tool call and result. Clients do not
+       * nest items, so these fold into the parent call's output rather than become orphan rows.
+       */
+      const handleChildActivity = Effect.fn("DimAdapter.handleChildActivity")(function* (
+        turn: ActiveDimTurn,
+        parentCallId: string,
+        name: string,
+        data: unknown,
+      ) {
+        if (name !== "step/tool-call" && name !== "step/tool-result") return;
+        const tool = turn.toolItems.get(parentCallId);
+        if (tool === undefined) return;
+        let appended = false;
+        const append = (line: string) => {
+          if (tool.childActivity.length >= DIM_MAX_CHILD_ACTIVITY_LINES) return;
+          tool.childActivity.push(dimChildActivityLine(line));
+          appended = true;
+        };
+        if (name === "step/tool-call") {
+          for (const call of dimToolCalls(data)) {
+            turn.childCallNames.set(call.callId, call.name);
+            append(`→ ${call.name} ${encodeJsonValue(call.input)}`);
+          }
+        } else {
+          for (const result of dimToolResults(data)) {
+            const callName = turn.childCallNames.get(result.callId) ?? "tool";
+            const outcome = result.isError
+              ? `error: ${result.content}`
+              : result.content.trim() === ""
+                ? "ok"
+                : result.content;
+            append(`← ${callName}: ${outcome}`);
+          }
+        }
+        // Nothing new folds in past the line cap, so the row would only repeat its full output.
+        if (!appended) return;
+        yield* emitToolItem(turn, tool, tool.status === "running" ? null : yield* DateTime.now);
+      });
+
       const handleEvent = Effect.fn("DimAdapter.handleEvent")(function* (event: DimSessionEvent) {
         let turn = activeTurn;
         if (!isRecord(event.event.data)) return;
@@ -1083,6 +1142,10 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           turn.dimTurnId !== null &&
           eventTurnId !== turn.dimTurnId
         ) {
+          return;
+        }
+        if (event.event.parentCallId !== null) {
+          yield* handleChildActivity(turn, event.event.parentCallId, name, data);
           return;
         }
         if (name === "input/message") {
@@ -1248,6 +1311,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
             startedAt,
             input: {},
             status: "running",
+            childActivity: [],
           });
           yield* emitToolItem(turn, turn.toolItems.get(callId)!, null);
           return;
@@ -1264,6 +1328,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
               startedAt,
               input: call.input,
               status: "running",
+              childActivity: [],
             });
           } else {
             existing.input = call.input;
@@ -2175,6 +2240,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           thinkingByRequest: new Map(),
           progressByRequest: new Map(),
           toolItems: new Map(),
+          childCallNames: new Map(),
           steers: new Map(),
           lastFailure: null,
         };
