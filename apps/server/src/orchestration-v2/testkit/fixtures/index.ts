@@ -167,7 +167,9 @@ import {
   assertDimToolCallDeniedWriteOutput,
   assertDimToolCallReadOnlyOnRequestOutput,
   assertDimTurnInterruptOutput,
+  assertDimSkillMentionOutput,
 } from "./dim_output.ts";
+import { dimSkillMentionInput } from "./dim_skill_mention/input.ts";
 import { assertPiSimpleOutput } from "./simple/pi_output.ts";
 import { simpleInput } from "./simple/input.ts";
 import { malformedSessionUpdateInput } from "./malformed_session_update/input.ts";
@@ -2246,6 +2248,18 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         recordedScenario: "stop_background_work_after_failed_turn",
         modelSelection: ACP_REGISTRY_MODEL_SELECTION,
         assertOutput: assertStopBackgroundWorkAfterFailedTurnOutput,
+      },
+    ],
+  },
+  {
+    name: "dim_skill_mention",
+    buildInput: dimSkillMentionInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("dim"),
+        transcriptFile: new URL("./dim_skill_mention/dim_transcript.ndjson", import.meta.url),
+        modelSelection: DIM_MODEL_SELECTION,
+        assertOutput: assertDimSkillMentionOutput,
       },
     ],
   },

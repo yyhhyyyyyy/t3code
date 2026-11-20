@@ -216,16 +216,6 @@ async function startFakeModel(): Promise<FakeModel> {
         reply("skill fixture complete");
         return;
       }
-      if (lastUser.includes("Use Code Mode to read fixture-note.txt")) {
-        if (phaseOf("code-mode") === 0) {
-          tool("codemode", {
-            code: "return await tools.call('read', { path: 'fixture-note.txt' });",
-          });
-          return;
-        }
-        reply("code mode fixture complete");
-        return;
-      }
       if (lastUser.includes("first repeat the exact final answer")) {
         reply(`${lastAssistant}\nprovider thread resume fixture second turn complete`);
         return;
