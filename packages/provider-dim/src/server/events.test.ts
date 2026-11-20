@@ -17,6 +17,7 @@ import {
   dimEffortDescriptor,
   dimModelFromCatalog,
   dimProviderFailure,
+  dimRollbackCut,
   dimUserInput,
 } from "./events.ts";
 
@@ -87,6 +88,54 @@ describe("dimUserInput", () => {
       { submissionId: "submission-1", text: "hello" },
     );
     assert.isNull(dimUserInput({ submission_id: "submission-2", user: { content: [] } }));
+  });
+});
+
+describe("dimRollbackCut", () => {
+  const turnEnd = (sequence: number, turnId: string) =>
+    event(sequence, "turn", "end", { turn_id: turnId, status: "completed", reason: "end_turn" });
+  const targetTurn = (nativeId: string | null, strength: "strong" | "weak") => ({
+    type: "provider_turn" as const,
+    providerTurn: {
+      nativeTurnRef: { driver: ProviderDriverKind.make("dim"), nativeId, strength },
+    },
+  });
+
+  it("cuts at the target turn's own turn/end", () => {
+    assert.deepEqual(
+      dimRollbackCut({
+        target: targetTurn("turn-a", "strong"),
+        events: [turnEnd(8, "turn-a"), turnEnd(18, "turn-b")],
+      }),
+      { at: 8 },
+    );
+  });
+
+  it("cuts at the start for a rollback to thread_start", () => {
+    assert.deepEqual(
+      dimRollbackCut({
+        target: { type: "thread_start" },
+        events: [turnEnd(8, "turn-a")],
+      }),
+      { at: 0 },
+    );
+  });
+
+  it("reports a target the Dim history cannot place", () => {
+    assert.deepEqual(
+      dimRollbackCut({
+        target: targetTurn("attempt:synthetic", "weak"),
+        events: [turnEnd(8, "turn-a")],
+      }),
+      { unavailable: "The rollback target turn has no native Dim turn id" },
+    );
+    assert.deepEqual(
+      dimRollbackCut({
+        target: targetTurn("turn-missing", "strong"),
+        events: [turnEnd(8, "turn-a")],
+      }),
+      { unavailable: "Dim history has no end for turn turn-missing" },
+    );
   });
 });
 

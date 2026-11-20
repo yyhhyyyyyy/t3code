@@ -54,6 +54,7 @@ import {
   dimAskUserQuestions,
   dimToolCalls,
   dimToolItemKind,
+  dimRollbackCut,
   dimToolResults,
   dimLatestTurnEndSequence,
   dimToolUse,
@@ -96,7 +97,7 @@ const DIM_CAPABILITIES: OrchestrationV2ProviderCapabilities = {
   threads: {
     canCreateEmptyThread: true,
     canReadThreadSnapshot: true,
-    canRollbackThread: false,
+    canRollbackThread: true,
     canForkThread: true,
     canForkFromTurn: true,
     canForkFromSubagentThread: false,
@@ -166,8 +167,8 @@ const DIM_CAPABILITIES: OrchestrationV2ProviderCapabilities = {
   checkpointing: {
     appCanCheckpointFilesystem: true,
     supportsNestedCheckpointScopes: false,
-    providerCanRollbackConversation: false,
-    providerRollbackReturnsSnapshot: false,
+    providerCanRollbackConversation: true,
+    providerRollbackReturnsSnapshot: true,
     providerCanReadConversationSnapshot: true,
   },
   identity: {
@@ -464,6 +465,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
       let defaultModel: { provider: string; modelId: string } | null = null;
       let appliedEffort: string | null = null;
       let appliedPreset: DimPermissionPreset | null = null;
+      let appliedTitle: string | null = null;
       let sessionMethods: { sessionId: string; names: ReadonlySet<string> } | null = null;
       let mcpBindingId: string | null = null;
       let mcpAttachedFor: string | null = null;
@@ -2054,6 +2056,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           appliedModel = modelFromAttach(attached);
           appliedEffort = null;
           appliedPreset = null;
+          appliedTitle = recordString(attached, "title") ?? null;
           const cwd = sessionEntity.cwd;
           const createdAt = yield* DateTime.now;
           const providerThread: OrchestrationV2ProviderThread = {
@@ -2713,20 +2716,144 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           const session = threadState;
           if (session === null || session.providerThread.id !== titleInput.providerThread.id)
             return;
+          // A rollback forks a new session, which starts untitled; remember the mirror to reapply.
+          appliedTitle = titleInput.title;
           // T3 already owns the title, so the Dim mirror is best effort.
           yield* connection
             .request("session.rename", { sessionId: session.sessionId, title: titleInput.title })
             .pipe(Effect.ignore);
         }),
-        rollbackThread: Effect.fn("DimAdapter.rollbackThread")(function* (
-          rollbackInput: ProviderAdapter.ProviderAdapterV2RollbackThreadInput,
-        ) {
-          return yield* new ProviderAdapter.ProviderAdapterRollbackThreadError({
-            driver: DIM_PROVIDER,
-            providerThreadId: rollbackInput.providerThread.id,
-            cause: "Dim does not support conversation rollback",
-          });
-        }),
+        rollbackThread: Effect.fn("DimAdapter.rollbackThread")(
+          function* (rollbackInput: ProviderAdapter.ProviderAdapterV2RollbackThreadInput) {
+            if (activeTurn !== null) {
+              return yield* protocolError("Cannot roll back while a Dim turn is active");
+            }
+            // `session.fork` needs a rest point: no task or request may still hold the branch.
+            if (backgroundTasks.size > 0) {
+              return yield* protocolError(
+                "Cannot roll back while a Dim background task is running",
+              );
+            }
+            if (pendingApprovals.size > 0 || pendingQuestions.size > 0) {
+              return yield* protocolError(
+                "Cannot roll back while a Dim request waits for an answer",
+              );
+            }
+            const sourceNativeId = rollbackInput.providerThread.nativeThreadRef?.nativeId;
+            if (sourceNativeId === null || sourceNativeId === undefined) {
+              return yield* protocolError("Dim rollback source has no session id");
+            }
+            const attachedSource = threadState?.sessionId !== sourceNativeId;
+            let sourceAttach: unknown;
+            if (attachedSource) {
+              sourceAttach = yield* connection.request("session.attach", {
+                sessionId: sourceNativeId,
+              });
+              if (recordField(sourceAttach, "running") === true) {
+                return yield* protocolError("Dim is still running work in this session");
+              }
+              threadState = {
+                sessionId: sourceNativeId,
+                cwd: sessionEntity.cwd,
+                providerThread: rollbackInput.providerThread,
+              };
+              appliedTitle = recordString(sourceAttach, "title") ?? null;
+            }
+            const history = yield* readHistory(sourceNativeId);
+            const cut = dimRollbackCut({ target: rollbackInput.target, events: history });
+            if ("unavailable" in cut) return yield* protocolError(cut.unavailable);
+            // A fork is Dim's only native truncation: the source keeps the full history and this
+            // thread moves to a new session holding just the prefix through the cut.
+            const reply = yield* connection.request("session.fork", {
+              sessionId: sourceNativeId,
+              at: cut.at,
+            });
+            const forkedSessionId = recordString(reply, "sessionId");
+            if (forkedSessionId === undefined) {
+              return yield* protocolError("Dim session.fork returned no sessionId");
+            }
+            const forkedAttach = yield* connection.request("session.attach", {
+              sessionId: forkedSessionId,
+            });
+            const now = yield* DateTime.now;
+            const providerThread: OrchestrationV2ProviderThread = {
+              ...rollbackInput.providerThread,
+              providerSessionId: input.providerSessionId,
+              nativeThreadRef: {
+                driver: DIM_PROVIDER,
+                nativeId: forkedSessionId,
+                strength: "strong",
+              },
+              nativeConversationHeadRef:
+                rollbackInput.target.type === "provider_turn"
+                  ? rollbackInput.target.providerTurn.nativeTurnRef
+                  : null,
+              status: "idle",
+              lastRunOrdinal:
+                rollbackInput.target.appRunOrdinal === 0
+                  ? null
+                  : rollbackInput.target.appRunOrdinal,
+              updatedAt: now,
+            };
+            threadState = { sessionId: forkedSessionId, cwd: sessionEntity.cwd, providerThread };
+            pendingImport = null;
+            // The fork copies the source configuration, but not what a runtime applies per turn.
+            appliedModel = modelFromAttach(forkedAttach);
+            appliedEffort = null;
+            appliedPreset = null;
+            if (appliedTitle !== null && appliedTitle !== "") {
+              yield* connection
+                .request("session.rename", { sessionId: forkedSessionId, title: appliedTitle })
+                .pipe(Effect.ignore);
+            }
+            yield* detachMcp;
+            yield* attachMcp(
+              rollbackInput.providerThread.appThreadId ?? input.threadId,
+              forkedSessionId,
+            ).pipe(Effect.ignore);
+            // The old session keeps its history in the daemon; this connection stops hosting it.
+            yield* connection
+              .request("session.detach", { sessionId: sourceNativeId })
+              .pipe(Effect.ignore);
+            const kept = history.filter((event) => event.sequence <= cut.at);
+            const snapshot = buildDimThreadSnapshot({
+              events: kept,
+              threadId: rollbackInput.providerThread.appThreadId ?? input.threadId,
+              providerThread,
+              driver: DIM_PROVIDER,
+              ids: {
+                message: (nativeItemId) =>
+                  idAllocator.derive.messageFromProviderItem({
+                    driver: DIM_PROVIDER,
+                    nativeItemId,
+                  }),
+                providerTurn: (nativeTurnId) =>
+                  idAllocator.derive.providerTurn({ driver: DIM_PROVIDER, nativeTurnId }),
+                node: (nativeItemId) =>
+                  idAllocator.derive.nodeFromProviderItem({ driver: DIM_PROVIDER, nativeItemId }),
+              },
+            });
+            return {
+              providerThread,
+              providerTurns: snapshot.providerTurns,
+              messages: snapshot.messages,
+              runtimeRequests: [],
+            };
+          },
+          (effect, rollbackInput) =>
+            effect.pipe(
+              Effect.mapError((cause) =>
+                isProviderAdapterProtocolError(cause)
+                  ? cause
+                  : new ProviderAdapter.ProviderAdapterRollbackThreadError({
+                      driver: DIM_PROVIDER,
+                      providerThreadId: rollbackInput.providerThread.id,
+                      checkpointId: rollbackInput.target.checkpointId,
+                      cause,
+                    }),
+              ),
+            ),
+        ),
         forkThread: Effect.fn("DimAdapter.forkThread")(
           function* (forkInput: ProviderAdapter.ProviderAdapterV2ForkThreadInput) {
             if (activeTurn !== null) {
