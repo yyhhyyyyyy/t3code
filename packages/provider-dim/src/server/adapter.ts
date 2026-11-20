@@ -1,5 +1,6 @@
 // @effect-diagnostics effectFnOpportunity:off -- session-local helpers close over one connection; a span per helper would repeat per session.
 import type {
+  ChatAttachment,
   MessageId,
   ModelSelection,
   OrchestrationV2ExecutionNode,
@@ -24,6 +25,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -34,7 +36,10 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
-import { providerMessageTextWithAttachmentPaths } from "@t3tools/provider-core/server/attachmentPrompt";
+import {
+  isProviderNativeImageAttachment,
+  providerMessageTextWithAttachmentPaths,
+} from "@t3tools/provider-core/server/attachmentPrompt";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 
@@ -105,6 +110,8 @@ const DIM_CAPABILITIES: OrchestrationV2ProviderCapabilities = {
     supportsActiveSteering: true,
     supportsSteeringByInterruptRestart: false,
     supportsQueuedMessages: true,
+    // A steer is one more session.submit, whose user content carries image blocks.
+    activeSteeringAcceptsAttachments: true,
     terminalStatusQuality: "strong",
   },
   streaming: {
@@ -180,6 +187,8 @@ const DIM_CONTEXT_USAGE_TIMEOUT = "2 seconds";
 const DIM_STEER_TIMEOUT = "10 seconds";
 const DIM_SKILLS_TIMEOUT = "3 seconds";
 const DIM_MAX_SEEN_EVENT_IDS = 2_048;
+// The daemon refuses a frame above 16 MiB, and every base64 image rides in one submit frame.
+const DIM_SUBMIT_IMAGE_BASE64_BUDGET = 12 * 1024 * 1024;
 
 export type DimConnectionFactoryError = DimConnectionError | DimDaemonError;
 
@@ -305,6 +314,8 @@ function dimSelection(selection: ModelSelection): {
   };
 }
 
+const dimBase64Length = (bytes: number): number => Math.ceil(bytes / 3) * 4;
+
 /** The `session.question.respond` answers, or null when a question has no answer Dim accepts. */
 function dimQuestionAnswers(
   questions: ReadonlyArray<OrchestrationV2UserInputQuestion>,
@@ -383,6 +394,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const host = yield* ProviderHost.ProviderHost;
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+  const fileSystem = yield* FileSystem.FileSystem;
   const contextWindows: Ref.Ref<ReadonlyMap<string, number>> =
     options.modelContextWindows ?? (yield* Ref.make<ReadonlyMap<string, number>>(new Map()));
 
@@ -549,6 +561,43 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
       /** Published text followed by the request's unpublished tail, unless newer commits make it stale. */
       const withLiveTail = (committed: string, live: string, offset: number) =>
         Array.from(committed).length <= offset ? scalarPrefix(committed, offset) + live : committed;
+
+      /**
+       * The user turn's Dim content: its text, then every supported image as a native base64
+       * block. Non-image attachments reach the agent through the text's saved-path lines.
+       */
+      const userContent = Effect.fn("DimAdapter.userContent")(function* (
+        text: string,
+        attachments: ReadonlyArray<ChatAttachment>,
+      ) {
+        const content: Array<Record<string, unknown>> = [{ type: "text", text }];
+        let encodedBytes = 0;
+        for (const attachment of attachments) {
+          if (!isProviderNativeImageAttachment(attachment)) continue;
+          if (
+            encodedBytes + dimBase64Length(attachment.sizeBytes) >
+            DIM_SUBMIT_IMAGE_BASE64_BUDGET
+          ) {
+            continue;
+          }
+          const path = host.resolveAttachmentPath(attachment);
+          if (path === null) continue;
+          const bytes = yield* fileSystem
+            .readFile(path)
+            .pipe(Effect.orElseSucceed(() => undefined));
+          if (bytes === undefined) continue;
+          encodedBytes += dimBase64Length(bytes.byteLength);
+          content.push({
+            type: "image",
+            source: {
+              type: "base64",
+              mediaType: attachment.mimeType.toLowerCase(),
+              data: Buffer.from(bytes).toString("base64"),
+            },
+          });
+        }
+        return content;
+      });
 
       const emitAssistant = Effect.fn("DimAdapter.emitAssistant")(function* (
         turn: ActiveDimTurn,
@@ -2287,6 +2336,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           if (text.trim() === "") {
             return yield* protocolError("Dim cannot submit an empty message");
           }
+          const content = yield* userContent(text, turnInput.message.attachments);
           const turnError = (cause: unknown) =>
             new ProviderAdapter.ProviderAdapterTurnStartError({
               driver: DIM_PROVIDER,
@@ -2304,7 +2354,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
               sessionId: session.sessionId,
               branchId: DIM_BRANCH,
               submissionId: turn.submissionId,
-              user: { content: [{ type: "text", text }] },
+              user: { content },
               mode: "queue",
             })
             .pipe(Effect.result);
@@ -2372,6 +2422,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
             resolveAttachmentPath: host.resolveAttachmentPath,
             resolveExtractedTextPath: host.resolveExtractedTextPath,
           });
+          const content = yield* userContent(text, steerInput.message.attachments);
           yield* connection
             .request(
               "session.submit",
@@ -2379,7 +2430,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
                 sessionId: session.sessionId,
                 branchId: DIM_BRANCH,
                 submissionId,
-                user: { content: [{ type: "text", text }] },
+                user: { content },
                 mode: "steer",
               },
               { timeout: DIM_STEER_TIMEOUT },
