@@ -24,13 +24,17 @@ t3code/fork/t3-dim install    # builds main and starts a launchd agent
 ## Everyday commands
 
 ```text
-t3-dim sync      merge upstream T3 Code into this fork; pushes only if the Dim checks pass
+t3-dim sync      rebase this fork onto upstream T3 Code; force-pushes only if the Dim checks pass
 t3-dim update    build the latest main; switches once no agent run is active
 t3-dim restart   start a staged build (refuses while agents run; --now forces it)
 t3-dim status    server, release and Dim provider state
 ```
 
 `t3-dim help` lists the rest. Updates keep every device paired: the data directory (`~/.t3`) and port (3780) never change after install.
+
+## History
+
+`main` is always upstream's `main` with this fork's commits on top, and no merge commits: `git log upstream/main..main` lists everything the fork adds. Because `t3-dim sync` rewrites those commits, update other clones with `git pull --rebase`, rebase open branches onto the new `main`, and merge pull requests here with **Rebase and merge**.
 
 ## Limits
 
