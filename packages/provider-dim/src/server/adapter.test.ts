@@ -1,5 +1,6 @@
 import {
   ChatAttachmentId,
+  CheckpointId,
   EnvironmentId,
   MessageId,
   NodeId,
@@ -107,6 +108,8 @@ class FakeDim {
   pendingQuestionBatches: ReadonlyArray<unknown> = [];
   failPreview = false;
   failSkills = false;
+  attachTitle: string | null = null;
+  attachedRunning = false;
   skills: ReadonlyArray<{ readonly name: string; readonly userInvocable: boolean }> = [
     { name: "dimfixture", userInvocable: true },
     { name: "operatoronly", userInvocable: false },
@@ -221,13 +224,14 @@ class FakeDim {
           };
         case "session.attach":
           return {
-            sessionId: SESSION_ID,
+            sessionId: params["sessionId"] ?? SESSION_ID,
             cwd: WORKSPACE,
             model: { providerId: "fixture", modelId: "fixture" },
             createdAt: 1,
-            running: false,
+            running: self.attachedRunning,
             sequence: 1,
             attachedClients: 1,
+            ...(self.attachTitle === null ? {} : { title: self.attachTitle }),
           };
         case "session.permission.get":
           return {
@@ -1606,6 +1610,185 @@ describe("DimAdapter fork", () => {
       assert.deepEqual(harness.fake.requestsOf("session.fork"), [
         { sessionId: SESSION_ID, at: 18 },
       ]);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+});
+
+describe("DimAdapter rollback", () => {
+  const turnEndEvent = (sequence: number, turnId: string) => ({
+    id: `event-${sequence}`,
+    sequence,
+    create_at: sequence,
+    type: "turn",
+    name: "end",
+    data: { turn_id: turnId, status: "completed", reason: "end_turn" },
+  });
+
+  const rollbackToTurn = (
+    thread: OrchestrationV2ProviderThread,
+    nativeTurnId: string,
+  ): ProviderAdapter.ProviderAdapterV2RollbackThreadInput => {
+    const target = providerTurnStub(thread.id, nativeTurnId);
+    return {
+      providerThread: thread,
+      target: {
+        type: "provider_turn",
+        checkpointId: CheckpointId.make("checkpoint-1"),
+        appRunOrdinal: 1,
+        providerTurn: target,
+      },
+      providerThreadTurns: [target],
+    };
+  };
+
+  it.effect("forks the target turn and moves the thread to the fork", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      yield* harness.runtime.applyThreadTitle!({ providerThread: thread, title: "Kept title" });
+      harness.fake.historyEvents = [
+        {
+          id: "e2",
+          sequence: 2,
+          create_at: 2,
+          type: "input",
+          name: "message",
+          data: {
+            submission_id: "submission-1",
+            user: { content: [{ type: "text", text: "first" }] },
+          },
+        },
+        {
+          id: "e5",
+          sequence: 5,
+          create_at: 5,
+          type: "turn",
+          name: "start",
+          data: { turn_id: "turn-a" },
+        },
+        turnEndEvent(8, "turn-a"),
+        turnEndEvent(18, "turn-b"),
+      ];
+      const snapshot = yield* harness.runtime.rollbackThread(rollbackToTurn(thread, "turn-a"));
+
+      assert.deepEqual(harness.fake.requestsOf("session.fork"), [{ sessionId: SESSION_ID, at: 8 }]);
+      assert.strictEqual(
+        snapshot.providerThread.nativeThreadRef?.nativeId,
+        harness.fake.forkSessionId,
+      );
+      assert.strictEqual(snapshot.providerThread.nativeConversationHeadRef?.nativeId, "turn-a");
+      assert.strictEqual(snapshot.providerThread.status, "idle");
+      assert.strictEqual(snapshot.providerThread.lastRunOrdinal, 1);
+      assert.deepEqual(
+        snapshot.messages.map((message) => ({ role: message.role, text: message.text })),
+        [{ role: "user", text: "first" }],
+      );
+      assert.deepEqual(
+        snapshot.providerTurns.map((turn) => turn.nativeTurnRef?.nativeId),
+        ["turn-a"],
+      );
+      assert.deepEqual(harness.fake.requestsOf("session.rename"), [
+        { sessionId: SESSION_ID, title: "Kept title" },
+        { sessionId: harness.fake.forkSessionId, title: "Kept title" },
+      ]);
+      assert.deepEqual(harness.fake.requestsOf("session.detach"), [{ sessionId: SESSION_ID }]);
+
+      // The next turn runs on the fork, not on the source session.
+      yield* harness.runtime.startTurn(turnInput(snapshot.providerThread));
+      assert.strictEqual(
+        harness.fake.requestsOf("session.submit").at(-1)?.["sessionId"],
+        harness.fake.forkSessionId,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("attaches the source session when this runtime has not hosted it yet", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness({ initialNativeThreadId: SESSION_ID });
+      harness.fake.attachTitle = "Restored title";
+      harness.fake.historyEvents = [turnEndEvent(8, "turn-a")];
+      const thread = attachedThread(SESSION_ID);
+      const snapshot = yield* harness.runtime.rollbackThread(rollbackToTurn(thread, "turn-a"));
+
+      assert.deepEqual(harness.fake.requestsOf("session.attach"), [
+        { sessionId: SESSION_ID },
+        { sessionId: harness.fake.forkSessionId },
+      ]);
+      assert.deepEqual(harness.fake.requestsOf("session.rename"), [
+        { sessionId: harness.fake.forkSessionId, title: "Restored title" },
+      ]);
+      assert.deepEqual(harness.fake.requestsOf("session.detach"), [{ sessionId: SESSION_ID }]);
+      assert.strictEqual(
+        snapshot.providerThread.nativeThreadRef?.nativeId,
+        harness.fake.forkSessionId,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("rolls back to thread start by forking at zero with no kept history", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      harness.fake.historyEvents = [turnEndEvent(8, "turn-a")];
+      const snapshot = yield* harness.runtime.rollbackThread({
+        providerThread: thread,
+        target: {
+          type: "thread_start",
+          checkpointId: CheckpointId.make("checkpoint-0"),
+          appRunOrdinal: 0,
+        },
+        providerThreadTurns: [],
+      });
+
+      assert.deepEqual(harness.fake.requestsOf("session.fork"), [{ sessionId: SESSION_ID, at: 0 }]);
+      assert.deepEqual(snapshot.messages, []);
+      assert.deepEqual(snapshot.providerTurns, []);
+      assert.isNull(snapshot.providerThread.nativeConversationHeadRef);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("refuses to roll back while a turn is active", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      yield* harness.runtime.startTurn(turnInput(thread));
+      const failed = yield* harness.runtime
+        .rollbackThread(rollbackToTurn(thread, "turn-a"))
+        .pipe(Effect.flip);
+      assert.strictEqual(failed._tag, "ProviderAdapterProtocolError");
+      assert.strictEqual(harness.fake.requestsOf("session.fork").length, 0);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("refuses to roll back while Dim background work is running", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      harness.fake.pushEvent("exec", "started", { task_id: "task-1", title: "sleep" });
+      yield* harness.waitFor(
+        (event) =>
+          event.type === "provider_thread.updated" &&
+          (event.providerThread.pendingBackgroundTasks?.length ?? 0) > 0,
+      );
+      const failed = yield* harness.runtime
+        .rollbackThread(rollbackToTurn(thread, "turn-a"))
+        .pipe(Effect.flip);
+      assert.strictEqual(failed._tag, "ProviderAdapterProtocolError");
+      assert.strictEqual(harness.fake.requestsOf("session.fork").length, 0);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("refuses to roll back a session Dim is still running", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness({ initialNativeThreadId: SESSION_ID });
+      harness.fake.attachedRunning = true;
+      harness.fake.historyEvents = [turnEndEvent(8, "turn-a")];
+      const thread = attachedThread(SESSION_ID);
+      const failed = yield* harness.runtime
+        .rollbackThread(rollbackToTurn(thread, "turn-a"))
+        .pipe(Effect.flip);
+      assert.strictEqual(failed._tag, "ProviderAdapterProtocolError");
+      assert.strictEqual(harness.fake.requestsOf("session.fork").length, 0);
     }).pipe(Effect.scoped, Effect.provide(layers)),
   );
 });

@@ -195,9 +195,11 @@ import { assertSubagentV2NestedApprovalOutput } from "./subagent_v2_nested_appro
 import { subagentV2NestedApprovalInput } from "./subagent_v2_nested_approval/input.ts";
 import { assertClaudeThreadRollbackOutput } from "./thread_rollback/claude_output.ts";
 import { assertThreadRollbackOutput } from "./thread_rollback/codex_output.ts";
+import { assertDimThreadRollbackOutput } from "./thread_rollback/dim_output.ts";
 import { threadRollbackInput } from "./thread_rollback/input.ts";
 import { assertPiThreadRollbackOutput } from "./thread_rollback/pi_output.ts";
 import { assertThreadRollbackAfterRestartOutput } from "./thread_rollback_after_restart/codex_output.ts";
+import { assertDimThreadRollbackAfterRestartOutput } from "./thread_rollback_after_restart/dim_output.ts";
 import { threadRollbackAfterRestartInput } from "./thread_rollback_after_restart/input.ts";
 import { threadRollbackAfterStopInput } from "./thread_rollback_after_stop/input.ts";
 import { assertPiThreadRollbackAfterStopOutput } from "./thread_rollback_after_stop/pi_output.ts";
@@ -2174,6 +2176,12 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         modelSelection: PI_MODEL_SELECTION,
         assertOutput: assertPiThreadRollbackOutput,
       },
+      {
+        driver: ProviderDriverKind.make("dim"),
+        transcriptFile: new URL("./thread_rollback/dim_transcript.ndjson", import.meta.url),
+        modelSelection: DIM_MODEL_SELECTION,
+        assertOutput: assertDimThreadRollbackOutput,
+      },
     ],
   },
   {
@@ -2188,6 +2196,15 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         ),
         modelSelection: CODEX_MODEL_SELECTION,
         assertOutput: assertThreadRollbackAfterRestartOutput,
+      },
+      {
+        driver: ProviderDriverKind.make("dim"),
+        transcriptFile: new URL(
+          "./thread_rollback_after_restart/dim_transcript.ndjson",
+          import.meta.url,
+        ),
+        modelSelection: DIM_MODEL_SELECTION,
+        assertOutput: assertDimThreadRollbackAfterRestartOutput,
       },
     ],
   },
