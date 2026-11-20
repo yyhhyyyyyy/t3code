@@ -1003,8 +1003,10 @@ cmd_uninstall() {
   fi
 }
 
+# Keeps origin/main as upstream/main plus the fork's own commits on top, with no
+# merge commits, so `git log upstream/main..origin/main` is exactly the fork.
 cmd_sync() {
-  local _dry _log _conflicts _merge_failed
+  local _dry _log _conflicts _base _gitdir _count _backup
   _dry=0
   if [ "${1:-}" = "--dry-run" ]; then _dry=1; fi
   [ -d "$REPO/.git" ] || die "no clone in $REPO; run t3-dim install"
@@ -1019,34 +1021,34 @@ cmd_sync() {
     git -C "$REPO" fetch --prune upstream
   } >>"$_log" 2>&1 || die "git fetch failed (see $_log)"
 
+  # An interrupted earlier run can leave a rebase or merge that blocks this one.
+  _gitdir=$(git -C "$REPO" rev-parse --absolute-git-dir)
+  if [ -d "$_gitdir/rebase-merge" ] || [ -d "$_gitdir/rebase-apply" ]; then
+    warn "an earlier rebase is still in progress in $REPO; aborting it"
+    git -C "$REPO" rebase --abort >>"$_log" 2>&1 || true
+  fi
   if git -C "$REPO" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
     warn "an earlier merge is still in progress in $REPO; aborting it"
     git -C "$REPO" merge --abort >>"$_log" 2>&1 || true
   fi
-  git -C "$REPO" switch --detach origin/main >>"$_log" 2>&1 || die "cannot check out origin/main (see $_log)"
-  _merge_failed=0
-  if ! git -C "$REPO" merge --no-ff --no-commit upstream/main >>"$_log" 2>&1; then
-    _merge_failed=1
+  _base=$(git -C "$REPO" rev-parse origin/main)
+  if git -C "$REPO" merge-base --is-ancestor upstream/main "$_base"; then
+    log "origin/main already contains upstream/main"
+    exit 0
   fi
-  _conflicts=$(git -C "$REPO" diff --name-only --diff-filter=U)
-  if [ -n "$_conflicts" ]; then
-    git -C "$REPO" merge --abort >>"$_log" 2>&1 || true
-    warn "upstream/main conflicts with origin/main; nothing was pushed"
-    printf 'conflicted files:\n%s\n' "$_conflicts" >&2
-    exit 1
-  fi
-  if [ "$_merge_failed" = "1" ]; then
-    git -C "$REPO" merge --abort >>"$_log" 2>&1 || true
-    warn "upstream/main did not merge; nothing was pushed (see $_log)"
+  _count=$(git -C "$REPO" rev-list --count --no-merges upstream/main.."$_base")
+  git -C "$REPO" switch --detach "$_base" >>"$_log" 2>&1 || die "cannot check out origin/main (see $_log)"
+  log "rebasing $_count fork commit(s) onto upstream/main"
+  if ! git -C "$REPO" rebase upstream/main >>"$_log" 2>&1; then
+    _conflicts=$(git -C "$REPO" diff --name-only --diff-filter=U)
+    git -C "$REPO" rebase --abort >>"$_log" 2>&1 || true
+    warn "the fork's commits do not rebase cleanly onto upstream/main; nothing was pushed"
+    if [ -n "$_conflicts" ]; then printf 'conflicted files:\n%s\n' "$_conflicts" >&2; fi
     tail -n 20 "$_log" >&2 || true
     exit 1
   fi
-  if ! git -C "$REPO" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-    log "upstream/main is already merged into origin/main"
-    exit 0
-  fi
 
-  log "upstream/main merged in $REPO; installing dependencies and running Dim checks"
+  log "rebased in $REPO; installing dependencies and running Dim checks"
   if ! {
     (cd "$REPO" && vp i --frozen-lockfile -- --yes) &&
       (cd "$REPO" && ./node_modules/.bin/vp run --filter @t3tools/provider-dim typecheck) &&
@@ -1056,23 +1058,24 @@ cmd_sync() {
         apps/server/src/orchestration-v2/testkit/DimReplayFixtures.integration.test.ts \
         apps/server/src/provider/DimSessionManagement.test.ts)
   } >>"$_log" 2>&1; then
-    git -C "$REPO" merge --abort >>"$_log" 2>&1 || true
     warn "typecheck or Dim tests failed; nothing was pushed (see $_log)"
     tail -n 30 "$_log" >&2 || true
     exit 1
   fi
   if [ "$_dry" = "1" ]; then
-    git -C "$REPO" merge --abort >>"$_log" 2>&1 || true
-    log "dry run passed: the merge is clean and dim/server checks pass; not pushed"
+    log "dry run passed: the fork rebases cleanly and dim/server checks pass; not pushed"
     exit 0
   fi
-  git -C "$REPO" commit -m "Merge upstream/main" >>"$_log" 2>&1 || die "cannot commit the merge (see $_log)"
-  if ! git -C "$REPO" push origin HEAD:main >>"$_log" 2>&1; then
-    warn "push to origin/main failed; the merge commit stays in $REPO (see $_log)"
+  _backup="pre-sync/$(date -u +%Y%m%dT%H%M%SZ)"
+  git -C "$REPO" tag "$_backup" "$_base" >>"$_log" 2>&1 || die "cannot tag the previous origin/main (see $_log)"
+  # The lease refuses the push if origin/main moved since the fetch above.
+  if ! git -C "$REPO" push --force-with-lease="main:$_base" origin HEAD:main >>"$_log" 2>&1; then
+    warn "push to origin/main failed, perhaps because it moved meanwhile; nothing changed (see $_log)"
     exit 1
   fi
-  log "pushed the merge to origin/main ($(git -C "$REPO" rev-parse --short=12 HEAD))"
-  log "run t3-dim update to build and activate it"
+  log "pushed: origin/main is upstream/main + $_count fork commit(s) ($(git -C "$REPO" rev-parse --short=12 HEAD))"
+  log "the previous origin/main is kept here as tag $_backup"
+  log "in other clones run 'git pull --rebase'; run t3-dim update to build and activate it"
 }
 
 cmd_help() {
@@ -1086,7 +1089,7 @@ t3-dim — run this fork's T3 Code server as a background launchd agent on macOS
   t3-dim status                                agent, release, server health and Dim provider state
   t3-dim logs [-f]                             tail the server logs (or follow them)
   t3-dim pair                                  mint a pairing link for this server
-  t3-dim sync [--dry-run]                      merge upstream/main, run checks, push to origin/main
+  t3-dim sync [--dry-run]                      rebase onto upstream/main, run checks, force-push origin/main
   t3-dim uninstall [--purge]                   unload the agent (--purge also drops releases and clone)
   t3-dim help                                  this text
 
