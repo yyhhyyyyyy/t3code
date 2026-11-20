@@ -74,6 +74,7 @@ import {
 } from "./protocol.ts";
 import type { McpProviderSessionConfig } from "@t3tools/provider-core/server/mcpSession";
 import type { DimDaemonError } from "./daemon.ts";
+import { dimSkillMentionText, hasDimSkillMention } from "./prompts.ts";
 import type { DimConnection, DimConnectionError } from "./transport.ts";
 
 export const DIM_PROVIDER: ProviderDriverKind = ProviderDriverKind.make("dim");
@@ -177,6 +178,7 @@ const DIM_MCP_LEASE_RENEW = "15 seconds";
 const DIM_MCP_ATTACH_TIMEOUT = "5 seconds";
 const DIM_CONTEXT_USAGE_TIMEOUT = "2 seconds";
 const DIM_STEER_TIMEOUT = "10 seconds";
+const DIM_SKILLS_TIMEOUT = "3 seconds";
 const DIM_MAX_SEEN_EVENT_IDS = 2_048;
 
 export type DimConnectionFactoryError = DimConnectionError | DimDaemonError;
@@ -1851,6 +1853,37 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
         }),
       );
 
+      /**
+       * The session's enabled, user-invocable Skill names. Read for every message that mentions
+       * one, so a Skill enabled while the thread is open still resolves. A failed read rewrites
+       * nothing: a `$word` that never named a Skill must stay the operator's prose.
+       */
+      const userInvocableSkills = Effect.fn("DimAdapter.userInvocableSkills")(function* () {
+        const session = threadState;
+        if (session === null) return null;
+        const reply = yield* connection
+          .request(
+            "session.skills",
+            { sessionId: session.sessionId, branchId: DIM_BRANCH },
+            { timeout: DIM_SKILLS_TIMEOUT },
+          )
+          .pipe(Effect.orElseSucceed(() => undefined));
+        if (!isRecord(reply)) return null;
+        const names = new Set<string>();
+        for (const entry of recordArray(reply, "skills") ?? []) {
+          if (!isRecord(entry) || recordField(entry, "userInvocable") !== true) continue;
+          const name = recordString(entry, "name");
+          if (name !== undefined) names.add(name);
+        }
+        return names;
+      });
+
+      const skillAwareText = Effect.fn("DimAdapter.skillAwareText")(function* (text: string) {
+        if (!hasDimSkillMention(text)) return text;
+        const names = yield* userInvocableSkills();
+        return names === null ? text : dimSkillMentionText(text, names);
+      });
+
       const probeSessionMethods = Effect.fn("DimAdapter.probeSessionMethods")(function* (
         sessionId: string,
       ) {
@@ -2246,7 +2279,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
             return yield* protocolError("Dim turn requested for a different thread");
           }
           const text = yield* providerMessageTextWithAttachmentPaths({
-            text: turnInput.message.text,
+            text: yield* skillAwareText(turnInput.message.text),
             attachments: turnInput.message.attachments,
             resolveAttachmentPath: host.resolveAttachmentPath,
             resolveExtractedTextPath: host.resolveExtractedTextPath,
@@ -2334,7 +2367,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
             status: "pending",
           });
           const text = yield* providerMessageTextWithAttachmentPaths({
-            text: steerInput.message.text,
+            text: yield* skillAwareText(steerInput.message.text),
             attachments: steerInput.message.attachments,
             resolveAttachmentPath: host.resolveAttachmentPath,
             resolveExtractedTextPath: host.resolveExtractedTextPath,

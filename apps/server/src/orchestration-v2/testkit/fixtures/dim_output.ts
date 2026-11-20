@@ -19,6 +19,7 @@ import {
   TOOL_CALL_WRITE_PROMPT,
 } from "./shared.ts";
 import { TOOL_CALL_DENIED_WRITE_PROMPT } from "./tool_call_denied_write/input.ts";
+import { DIM_SKILL_PROMPT } from "./dim_skill_mention/input.ts";
 import { assertPlanQuestionsOutputBase } from "./plan_questions/codex_output.ts";
 import { assertSimpleOutput } from "./simple/codex_output.ts";
 import { assertMultiTurnOutput } from "./multi_turn/codex_output.ts";
@@ -179,4 +180,29 @@ export function assertDimPlanQuestionsOutput(
 ) {
   assertDimBase(result, transcript);
   assertPlanQuestionsOutputBase(result, transcript);
+}
+
+export function assertDimSkillMentionOutput(
+  result: OrchestratorV2ScenarioResult,
+  transcript: ProviderReplayTranscript,
+) {
+  const projection = assertDimBase(result, transcript);
+  assertBaseProjection({ result, transcript, runCount: 1, runStatuses: ["completed"] });
+  assertSemanticProjectionIntegrity(projection);
+  // The app keeps the operator's own words; only what Dim receives carries its token.
+  assertUserMessagesInclude(projection, [DIM_SKILL_PROMPT]);
+  assertAssistantTextIncludes(projection, "skill fixture complete");
+  const submitted: Array<string | undefined> = [];
+  for (const entry of transcript.entries) {
+    const frame = entry.type === "expect_outbound" ? entry.frame : undefined;
+    if (typeof frame !== "object" || frame === null) continue;
+    if (Reflect.get(frame, "method") !== "session.submit") continue;
+    const params = Reflect.get(frame, "params") as {
+      readonly user?: { readonly content?: ReadonlyArray<unknown> };
+    };
+    const first = params.user?.content?.[0] as { readonly text?: unknown } | undefined;
+    submitted.push(typeof first?.text === "string" ? first.text : undefined);
+  }
+  assert.lengthOf(submitted, 1, "the turn submits once");
+  assert.isTrue(submitted[0]?.startsWith("Use /skill:dimfixture and reply"));
 }
