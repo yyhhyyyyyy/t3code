@@ -1,4 +1,5 @@
 import {
+  ChatAttachmentId,
   EnvironmentId,
   MessageId,
   NodeId,
@@ -9,6 +10,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  type ChatAttachment,
   type ModelSelection,
   type OrchestrationV2AppThread,
   type OrchestrationV2ProviderThread,
@@ -20,6 +22,8 @@ import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -30,6 +34,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 
 import { DIM_PROVIDER, makeDimAdapterV2 } from "./adapter.ts";
@@ -410,6 +415,7 @@ const turnInput = (
     readonly text?: string;
     readonly runtimeMode?: RuntimeMode;
     readonly modelSelection?: ModelSelection;
+    readonly attachments?: ReadonlyArray<ChatAttachment>;
   },
 ): ProviderAdapter.ProviderAdapterV2TurnInput => ({
   appThread: { id: THREAD_ID } as OrchestrationV2AppThread,
@@ -423,13 +429,29 @@ const turnInput = (
   message: {
     messageId: MessageId.make("message-1"),
     text: input?.text ?? "hello",
-    attachments: [],
+    attachments: input?.attachments ?? [],
     createdBy: "user",
     creationSource: "server",
   },
   modelSelection: input?.modelSelection ?? modelSelection(),
   runtimePolicy: runtimePolicy(input?.runtimeMode ?? "full-access"),
 });
+
+const imageAttachment = (id: string): ChatAttachment => ({
+  type: "image",
+  id: ChatAttachmentId.make(id),
+  name: `${id}.png`,
+  mimeType: "image/png",
+  sizeBytes: 4,
+});
+
+const writeAttachment = (id: string, bytes: ReadonlyArray<number>) =>
+  Effect.gen(function* () {
+    const host = yield* ProviderHost.ProviderHost;
+    const path = yield* Path.Path;
+    const fileSystem = yield* FileSystem.FileSystem;
+    yield* fileSystem.writeFile(path.join(host.paths.attachmentsDir, id), Uint8Array.from(bytes));
+  });
 
 const isTerminal = (event: Event) => event.type === "turn.terminal";
 
@@ -1731,6 +1753,76 @@ describe("DimAdapter skill mentions", () => {
       const thread = yield* ensureThread(harness.runtime);
       yield* harness.runtime.startTurn(turnInput(thread, { text: "hello" }));
       assert.lengthOf(harness.fake.requestsOf("session.skills"), 0);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+});
+
+describe("DimAdapter turn content", () => {
+  it.effect("submits supported images as native blocks", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      yield* writeAttachment("image-1", [137, 80, 78, 71]);
+      yield* harness.runtime.startTurn(
+        turnInput(thread, {
+          text: "this screenshot",
+          attachments: [imageAttachment("image-1")],
+        }),
+      );
+      const submit = harness.fake.requestsOf("session.submit")[0]!;
+      const content = (submit["user"] as { content: ReadonlyArray<Record<string, unknown>> })
+        .content;
+      assert.strictEqual(content[0]?.["type"], "text");
+      const text = content[0]?.["text"];
+      assert.isTrue(
+        typeof text === "string" &&
+          text.startsWith('this screenshot\n\n[Attached image "image-1.png" is saved at: '),
+      );
+      assert.deepEqual(content[1], {
+        type: "image",
+        source: { type: "base64", mediaType: "image/png", data: "iVBORw==" },
+      });
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("sends a steer's image as a native block too", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      yield* writeAttachment("image-2", [137, 80, 78, 71]);
+      yield* harness.runtime.startTurn(turnInput(thread));
+      const started = yield* harness.waitFor((event) => event.type === "provider_turn.updated");
+      const providerTurnId =
+        started.type === "provider_turn.updated" ? started.providerTurn.id : undefined;
+      harness.fake.pushEvent("input", "applied", { input_id: "input-1", mode: "queue" });
+      harness.fake.pushEvent("turn", "start", { turn_id: "turn-1" });
+      yield* harness.runtime.steerTurn({
+        threadId: THREAD_ID,
+        runId: RunId.make("run-1"),
+        providerThread: thread,
+        providerTurnId: providerTurnId!,
+        message: {
+          messageId: MessageId.make("message-steer"),
+          text: "again please",
+          attachments: [imageAttachment("image-2")],
+          createdBy: "user",
+          creationSource: "server",
+        },
+      });
+      const steerSubmit = harness.fake.requestsOf("session.submit")[1]!;
+      assert.strictEqual(steerSubmit["mode"], "steer");
+      const content = (steerSubmit["user"] as { content: ReadonlyArray<Record<string, unknown>> })
+        .content;
+      const steerText = content[0]?.["text"];
+      assert.isTrue(
+        typeof steerText === "string" &&
+          steerText.startsWith('again please\n\n[Attached image "image-2.png" is saved at: '),
+      );
+      assert.match(String(steerText), /\[Attached image "image-2\.png" is saved at: .*image-2\]/u);
+      assert.deepEqual(content[1], {
+        type: "image",
+        source: { type: "base64", mediaType: "image/png", data: "iVBORw==" },
+      });
     }).pipe(Effect.scoped, Effect.provide(layers)),
   );
 });
