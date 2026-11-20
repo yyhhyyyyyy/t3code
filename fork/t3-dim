@@ -417,6 +417,72 @@ self_update_from() {
   log "updated the t3-dim script from release $1"
 }
 
+# ---------------------------------------------------------------- settings
+
+# Clients decide enablement from settings.json alone, and an instance without an entry is off
+# unless it is a codex/claudeAgent default. The server fills every missing field with its default,
+# so this one entry is a valid file. Must run with the agent stopped; both install paths restart it.
+ensure_dim_instance() {
+  local _file _out
+  _file="$BASE_DIR/userdata/settings.json"
+  mkdir -p "$BASE_DIR/userdata"
+  if ! _out=$(T3DIM_SETTINGS_FILE="$_file" node --input-type=commonjs -e '
+const fs = require("fs");
+const file = process.env.T3DIM_SETTINGS_FILE;
+const isObject = (value) =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+const fail = (message) => {
+  console.error(message);
+  process.exit(2);
+};
+let settings = {};
+let target = file;
+if (fs.existsSync(file)) {
+  target = fs.realpathSync(file);
+  let raw;
+  try {
+    raw = fs.readFileSync(target, "utf8");
+  } catch (error) {
+    fail("cannot read " + file + ": " + error.message);
+  }
+  try {
+    settings = JSON.parse(raw);
+  } catch (error) {
+    fail("cannot parse " + file + ": " + error.message);
+  }
+  if (!isObject(settings)) fail(file + " does not hold a JSON object");
+}
+if (settings.providerInstances === undefined) {
+  settings.providerInstances = {};
+} else if (!isObject(settings.providerInstances)) {
+  fail("providerInstances in " + file + " is not an object");
+}
+if (Object.hasOwn(settings.providerInstances, "dim")) {
+  console.log("present");
+  process.exit(0);
+}
+settings.providerInstances.dim = { driver: "dim", enabled: true };
+const temporary = target + ".t3dim.tmp";
+let mode = 0o600;
+if (target !== file || fs.existsSync(file)) {
+  try {
+    mode = fs.statSync(target).mode & 0o777;
+  } catch {}
+}
+fs.writeFileSync(temporary, JSON.stringify(settings, null, 2) + "\n", { mode });
+fs.chmodSync(temporary, mode);
+fs.renameSync(temporary, target);
+console.log("written");
+' 2>&1); then
+    warn "could not update $_file: $_out"
+    warn 'add "dim": { "driver": "dim", "enabled": true } to providerInstances by hand so clients offer Dim'
+    return 0
+  fi
+  if [ "$_out" = "written" ]; then
+    log "enabled the Dim provider in settings.json"
+  fi
+}
+
 # ---------------------------------------------------------------- repo + releases
 
 ensure_repo() {
@@ -709,11 +775,13 @@ cmd_install() {
   write_runner
   write_plist
   install_self
+  # Both branches below start the server again; settings.json is only safe to edit meanwhile.
+  if agent_loaded; then stop_agent; fi
+  ensure_dim_instance
   _cur=$(current_name || true)
   if [ -n "$_cur" ] && [ "$_cur" != "$_name" ]; then
     switch_release "$_name" || die "could not activate $_name (see $LOG_DIR)"
   else
-    if agent_loaded; then stop_agent; fi
     point_current "$_name" || die "cannot point $CURRENT at $_name"
     if [ -z "$_cur" ]; then rm -f "$STATE/previous" "$STATE/staged"; fi
     start_agent || die "launchctl could not load $PLIST"
