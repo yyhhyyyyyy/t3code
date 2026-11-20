@@ -19,6 +19,7 @@ import {
   TOOL_CALL_WRITE_PROMPT,
 } from "./shared.ts";
 import { TOOL_CALL_DENIED_WRITE_PROMPT } from "./tool_call_denied_write/input.ts";
+import { DIM_CODE_MODE_PROMPT } from "./dim_code_mode/input.ts";
 import { DIM_SKILL_PROMPT } from "./dim_skill_mention/input.ts";
 import { assertPlanQuestionsOutputBase } from "./plan_questions/codex_output.ts";
 import { assertSimpleOutput } from "./simple/codex_output.ts";
@@ -205,4 +206,22 @@ export function assertDimSkillMentionOutput(
   }
   assert.lengthOf(submitted, 1, "the turn submits once");
   assert.isTrue(submitted[0]?.startsWith("Use /skill:dimfixture and reply"));
+}
+
+export function assertDimCodeModeOutput(
+  result: OrchestratorV2ScenarioResult,
+  transcript: ProviderReplayTranscript,
+) {
+  const projection = assertDimBase(result, transcript);
+  assertBaseProjection({ result, transcript, runCount: 1, runStatuses: ["completed"] });
+  assertSemanticProjectionIntegrity(projection);
+  assertUserMessagesInclude(projection, [DIM_CODE_MODE_PROMPT]);
+  assertAssistantTextIncludes(projection, "code mode fixture complete");
+  const tools = projection.turnItems.filter((item) => item.type === "dynamic_tool");
+  assert.lengthOf(tools, 1, "only the parent Code Mode call gets a row");
+  assert.strictEqual(tools[0]?.title, "codemode");
+  const output = tools[0]?.type === "dynamic_tool" ? (tools[0].output ?? "") : "";
+  assert.include(output, "→ read");
+  assert.include(output, "← read:");
+  assert.include(output, "code mode child content");
 }
