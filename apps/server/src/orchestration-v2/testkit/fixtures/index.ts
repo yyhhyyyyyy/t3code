@@ -163,8 +163,10 @@ import {
   assertDimToolCallReadOnlyOnRequestOutput,
   assertDimTurnInterruptOutput,
   assertDimSkillMentionOutput,
+  assertDimCodeModeOutput,
 } from "./dim_output.ts";
 import { dimSkillMentionInput } from "./dim_skill_mention/input.ts";
+import { dimCodeModeInput } from "./dim_code_mode/input.ts";
 import { assertPiSimpleOutput } from "./simple/pi_output.ts";
 import { simpleInput } from "./simple/input.ts";
 import { malformedSessionUpdateInput } from "./malformed_session_update/input.ts";
@@ -2216,6 +2218,18 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         transcriptFile: new URL("./dim_skill_mention/dim_transcript.ndjson", import.meta.url),
         modelSelection: DIM_MODEL_SELECTION,
         assertOutput: assertDimSkillMentionOutput,
+      },
+    ],
+  },
+  {
+    name: "dim_code_mode",
+    buildInput: dimCodeModeInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("dim"),
+        transcriptFile: new URL("./dim_code_mode/dim_transcript.ndjson", import.meta.url),
+        modelSelection: DIM_MODEL_SELECTION,
+        assertOutput: assertDimCodeModeOutput,
       },
     ],
   },
