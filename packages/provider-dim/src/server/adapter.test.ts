@@ -101,6 +101,11 @@ class FakeDim {
   failQuestionRespond = false;
   pendingQuestionBatches: ReadonlyArray<unknown> = [];
   failPreview = false;
+  failSkills = false;
+  skills: ReadonlyArray<{ readonly name: string; readonly userInvocable: boolean }> = [
+    { name: "dimfixture", userInvocable: true },
+    { name: "operatoronly", userInvocable: false },
+  ];
   defaultModel = { providerId: "fixture", modelId: "default-model" };
   historyEvents: Array<{
     readonly id: string;
@@ -282,6 +287,11 @@ class FakeDim {
           return { sessionId: self.forkSessionId, sequence: 1 };
         case "session.methods":
           return { methods: self.methods.map((name) => ({ name, mutating: false })) };
+        case "session.skills":
+          if (self.failSkills) {
+            return yield* new DimTransportError({ detail: "skills failed" });
+          }
+          return { skills: self.skills };
         case "session.context.compact": {
           self.pushEvent("context", "compaction-start", { command: 1, through: 1 });
           if (self.compactMode === "completed") {
@@ -1649,6 +1659,78 @@ describe("DimAdapter compaction", () => {
       const failed = yield* harness.runtime.compactThread!(turnInput(thread)).pipe(Effect.flip);
       assert.strictEqual(failed._tag, "ProviderAdapterProtocolError");
       assert.strictEqual(harness.fake.requestsOf("session.context.compact").length, 0);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+});
+
+describe("DimAdapter skill mentions", () => {
+  const submittedText = (harness: { readonly fake: FakeDim }, index = 0): unknown => {
+    const submit = harness.fake.requestsOf("session.submit")[index]!;
+    const content = (submit["user"] as { content: ReadonlyArray<Record<string, unknown>> }).content;
+    return content[0]?.["text"];
+  };
+
+  it.effect("rewrites a listed Skill's mention and keeps other $words", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      yield* harness.runtime.startTurn(
+        turnInput(thread, { text: "$dimfixture and $HOME and $operatoronly" }),
+      );
+      assert.deepEqual(harness.fake.requestsOf("session.skills"), [
+        { sessionId: SESSION_ID, branchId: "main" },
+      ]);
+      // `$HOME` is no Skill, and an operator-only Skill's token would not load either.
+      assert.strictEqual(submittedText(harness), "/skill:dimfixture and $HOME and $operatoronly");
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("reads the catalog again so a Skill enabled mid-turn resolves", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      yield* harness.runtime.startTurn(turnInput(thread, { text: "$dimfixture first" }));
+      const started = yield* harness.waitFor((event) => event.type === "provider_turn.updated");
+      const providerTurnId =
+        started.type === "provider_turn.updated" ? started.providerTurn.id : undefined;
+      harness.fake.pushEvent("input", "applied", { input_id: "input-1", mode: "queue" });
+      harness.fake.pushEvent("turn", "start", { turn_id: "turn-1" });
+      // The catalog changed after the turn started: the steer must see the new Skill.
+      harness.fake.skills = [...harness.fake.skills, { name: "enabledlater", userInvocable: true }];
+      yield* harness.runtime.steerTurn({
+        threadId: THREAD_ID,
+        runId: RunId.make("run-1"),
+        providerThread: thread,
+        providerTurnId: providerTurnId!,
+        message: {
+          messageId: MessageId.make("message-steer"),
+          text: "$enabledlater again",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "server",
+        },
+      });
+      assert.lengthOf(harness.fake.requestsOf("session.skills"), 2);
+      assert.strictEqual(submittedText(harness, 1), "/skill:enabledlater again");
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("rewrites nothing when the catalog cannot be read", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      harness.fake.failSkills = true;
+      yield* harness.runtime.startTurn(turnInput(thread, { text: "$dimfixture please" }));
+      assert.strictEqual(submittedText(harness), "$dimfixture please");
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("skips the catalog when the message carries no mention", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      yield* harness.runtime.startTurn(turnInput(thread, { text: "hello" }));
+      assert.lengthOf(harness.fake.requestsOf("session.skills"), 0);
     }).pipe(Effect.scoped, Effect.provide(layers)),
   );
 });
