@@ -230,6 +230,15 @@ async function startFakeModel(): Promise<FakeModel> {
         reply(`${lastAssistant}\nprovider thread resume fixture second turn complete`);
         return;
       }
+      // Echo the prompts the model was given, so the rollback fixture proves what the fork holds.
+      if (lastUser.includes("Repeat the conversation verbatim.")) {
+        const prompts = messages
+          .filter((message) => message.role === "user")
+          .map((message) => textOf(message.content).trim())
+          .filter((text) => text !== "" && !text.startsWith("<dim-state"));
+        reply(`Conversation so far:\n${prompts.join("\n---\n")}`);
+        return;
+      }
       const exact = /exactly: (.*)/s.exec(lastUser) ?? /following text: (.*)/s.exec(lastUser);
       if (exact !== null) {
         reply(exact[1]!.trim());
