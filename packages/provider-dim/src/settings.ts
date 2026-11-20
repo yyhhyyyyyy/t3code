@@ -9,8 +9,7 @@ import * as Schema from "effect/Schema";
 
 export const DimSettings = makeProviderSettingsSchema(
   {
-    // The default instance must arrive enabled: clients that predate this driver render its
-    // settings read-only, so nobody could turn it on from them.
+    // Clients count Dim as enabled only when settings.json lists this instance; `fork/t3-dim install` writes that entry.
     enabled: Schema.Boolean.pipe(
       Schema.withDecodingDefault(Effect.succeed(true)),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
