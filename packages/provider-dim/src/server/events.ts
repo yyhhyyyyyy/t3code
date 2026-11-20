@@ -558,3 +558,27 @@ export function dimLatestTurnEndSequence(
   }
   return latest;
 }
+
+/**
+ * The `session.fork` cut that keeps only the rollback target's history: the target turn's own
+ * `turn/end`, or 0 for a rollback to the conversation start.
+ */
+export function dimRollbackCut(input: {
+  readonly target:
+    | { readonly type: "thread_start" }
+    | {
+        readonly type: "provider_turn";
+        readonly providerTurn: Pick<OrchestrationV2ProviderTurn, "nativeTurnRef">;
+      };
+  readonly events: ReadonlyArray<DimSessionEvent["event"]>;
+}): { readonly at: number } | { readonly unavailable: string } {
+  if (input.target.type === "thread_start") return { at: 0 };
+  const ref = input.target.providerTurn.nativeTurnRef;
+  if (ref === null || ref.nativeId === null || ref.strength !== "strong") {
+    return { unavailable: "The rollback target turn has no native Dim turn id" };
+  }
+  const at = dimTurnEndSequence(input.events, ref.nativeId);
+  return at === undefined
+    ? { unavailable: `Dim history has no end for turn ${ref.nativeId}` }
+    : { at };
+}
