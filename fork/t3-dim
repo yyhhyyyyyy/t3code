@@ -223,7 +223,7 @@ stop_agent() {
   done
   if [ -z "$_pid" ]; then return 0; fi
   _i=0
-  while kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 60 ]; do
+  while kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 190 ]; do
     sleep 0.5
     _i=$((_i + 1))
   done
@@ -362,9 +362,11 @@ write_plist() {
     <false/>
   </dict>
   <key>ThrottleInterval</key>
-  <integer>30</integer>
+  <integer>5</integer>
+  <key>ExitTimeOut</key>
+  <integer>90</integer>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Interactive</string>
   <key>WorkingDirectory</key>
   <string>$_root</string>
   <key>EnvironmentVariables</key>
@@ -615,6 +617,8 @@ switch_release() {
     log "release $_new is already active"
     return 0
   fi
+  # kickstart never rereads the plist; the bootstrap below loads this copy.
+  write_plist
   log "stopping server"
   stop_agent
   if ! backup_db "${_old:-unknown}"; then
