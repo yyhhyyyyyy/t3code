@@ -1,14 +1,4 @@
-import {
-  MessageId,
-  NodeId,
-  ProviderDriverKind,
-  ProviderInstanceId,
-  ProviderThreadId,
-  ProviderTurnId,
-  ThreadId,
-  type OrchestrationV2ProviderThread,
-} from "@t3tools/contracts";
-import * as DateTime from "effect/DateTime";
+import { MessageId, ProviderDriverKind, ThreadId } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 
 import {
@@ -47,30 +37,6 @@ const event = (
 
 const ids = {
   message: (nativeItemId: string) => MessageId.make(`message:${nativeItemId}`),
-  providerTurn: (nativeTurnId: string) => ProviderTurnId.make(`turn:${nativeTurnId}`),
-  node: (nativeItemId: string) => NodeId.make(`node:${nativeItemId}`),
-};
-
-const providerThread: OrchestrationV2ProviderThread = {
-  id: ProviderThreadId.make("provider-thread:dim:main"),
-  driver: ProviderDriverKind.make("dim"),
-  providerInstanceId: ProviderInstanceId.make("dim"),
-  providerSessionId: null,
-  appThreadId: ThreadId.make("thread-1"),
-  ownerNodeId: null,
-  nativeThreadRef: null,
-  nativeConversationHeadRef: null,
-  status: "idle" as const,
-  firstRunOrdinal: null,
-  lastRunOrdinal: null,
-  handoffIds: [],
-  forkedFrom: null,
-  pendingBackgroundTasks: [],
-  contextUsage: null,
-  nativeMetadata: null,
-  goal: null,
-  createdAt: DateTime.nowUnsafe(),
-  updatedAt: DateTime.nowUnsafe(),
 };
 
 describe("dimUserInput", () => {
@@ -140,7 +106,7 @@ describe("dimRollbackCut", () => {
 });
 
 describe("buildDimThreadSnapshot", () => {
-  it("rebuilds messages and turns while dropping dim-state inputs", () => {
+  it("rebuilds messages while dropping dim-state inputs", () => {
     const snapshot = buildDimThreadSnapshot({
       events: [
         event(1, "input", "message", {
@@ -173,9 +139,7 @@ describe("buildDimThreadSnapshot", () => {
         event(12, "turn", "end", { turn_id: "turn-b", status: "completed", reason: "end_turn" }),
       ],
       threadId: ThreadId.make("thread-1"),
-      providerThread,
       ids,
-      driver: ProviderDriverKind.make("dim"),
     });
 
     assert.deepEqual(
@@ -189,24 +153,6 @@ describe("buildDimThreadSnapshot", () => {
       ],
     );
     assert.deepEqual(snapshot.reasoningMessageIds, [MessageId.make("message:reasoning:request-1")]);
-    assert.strictEqual(snapshot.providerTurns.length, 2);
-    assert.strictEqual(snapshot.providerTurns[0]!.id, ProviderTurnId.make("turn:turn-a"));
-    assert.strictEqual(snapshot.providerTurns[0]!.ordinal, 1);
-    assert.strictEqual(snapshot.providerTurns[0]!.status, "completed");
-    assert.strictEqual(snapshot.providerTurns[1]!.id, ProviderTurnId.make("turn:turn-b"));
-    assert.strictEqual(snapshot.providerTurns[1]!.ordinal, 2);
-  });
-
-  it("leaves an unfinished turn running", () => {
-    const snapshot = buildDimThreadSnapshot({
-      events: [event(1, "turn", "start", { turn_id: "turn-a" })],
-      threadId: ThreadId.make("thread-1"),
-      providerThread,
-      ids,
-      driver: ProviderDriverKind.make("dim"),
-    });
-    assert.strictEqual(snapshot.providerTurns[0]!.status, "running");
-    assert.isNull(snapshot.providerTurns[0]!.completedAt);
   });
 });
 

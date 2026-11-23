@@ -2672,23 +2672,16 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           const snapshot = buildDimThreadSnapshot({
             events: collected,
             threadId: snapshotInput.providerThread.appThreadId ?? input.threadId,
-            providerThread: snapshotInput.providerThread,
-            driver: DIM_PROVIDER,
             ids: {
               message: (nativeItemId) =>
                 idAllocator.derive.messageFromProviderItem({
                   driver: DIM_PROVIDER,
                   nativeItemId,
                 }),
-              providerTurn: (nativeTurnId) =>
-                idAllocator.derive.providerTurn({ driver: DIM_PROVIDER, nativeTurnId }),
-              node: (nativeItemId) =>
-                idAllocator.derive.nodeFromProviderItem({ driver: DIM_PROVIDER, nativeItemId }),
             },
           });
           return {
             providerThread: snapshotInput.providerThread,
-            providerTurns: snapshot.providerTurns,
             messages: snapshot.messages,
             reasoningMessageIds: snapshot.reasoningMessageIds,
             runtimeRequests: [],
@@ -2819,23 +2812,16 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
             const snapshot = buildDimThreadSnapshot({
               events: kept,
               threadId: rollbackInput.providerThread.appThreadId ?? input.threadId,
-              providerThread,
-              driver: DIM_PROVIDER,
               ids: {
                 message: (nativeItemId) =>
                   idAllocator.derive.messageFromProviderItem({
                     driver: DIM_PROVIDER,
                     nativeItemId,
                   }),
-                providerTurn: (nativeTurnId) =>
-                  idAllocator.derive.providerTurn({ driver: DIM_PROVIDER, nativeTurnId }),
-                node: (nativeItemId) =>
-                  idAllocator.derive.nodeFromProviderItem({ driver: DIM_PROVIDER, nativeItemId }),
               },
             });
             return {
               providerThread,
-              providerTurns: snapshot.providerTurns,
               messages: snapshot.messages,
               runtimeRequests: [],
             };
