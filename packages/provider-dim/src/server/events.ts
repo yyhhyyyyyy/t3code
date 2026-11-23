@@ -1,17 +1,13 @@
 import type {
   MessageId,
-  NodeId,
   OrchestrationV2ConversationMessage,
   OrchestrationV2ProviderFailure,
-  OrchestrationV2ProviderThread,
   OrchestrationV2ProviderTurn,
   OrchestrationV2UserInputQuestion,
-  ProviderDriverKind,
   ProviderOptionDescriptor,
   ProviderRequestKind,
   ServerProviderModel,
   ThreadId,
-  ProviderTurnId,
 } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import * as DateTime from "effect/DateTime";
@@ -355,13 +351,10 @@ export function dimModelsFromConfigFile(input: unknown): ReadonlyArray<DimCatalo
 
 export interface DimSnapshotIds {
   readonly message: (nativeItemId: string) => MessageId;
-  readonly providerTurn: (nativeTurnId: string) => ProviderTurnId;
-  readonly node: (nativeItemId: string) => NodeId;
 }
 
 export interface DimThreadSnapshotBuild {
   readonly messages: ReadonlyArray<OrchestrationV2ConversationMessage>;
-  readonly providerTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
   readonly reasoningMessageIds: ReadonlyArray<MessageId>;
 }
 
@@ -400,13 +393,11 @@ function conversationMessage(input: {
   };
 }
 
-/** Builds T3's messages and turns from a Dim branch history (`session.history` events). */
+/** Builds T3's messages from a Dim branch history (`session.history` events). */
 export function buildDimThreadSnapshot(input: {
   readonly events: ReadonlyArray<DimSessionEvent["event"]>;
   readonly threadId: ThreadId;
-  readonly providerThread: OrchestrationV2ProviderThread;
   readonly ids: DimSnapshotIds;
-  readonly driver: ProviderDriverKind;
 }): DimThreadSnapshotBuild {
   const ordered: Array<{
     readonly sequence: number;
@@ -416,10 +407,6 @@ export function buildDimThreadSnapshot(input: {
   }> = [];
   const assistant = new Map<string, TextAccumulator>();
   const reasoning = new Map<string, TextAccumulator>();
-  const turns = new Map<
-    string,
-    { sequence: number; startedAt: DateTime.Utc; completedAt: DateTime.Utc | null; status: string }
-  >();
 
   const accumulate = (target: Map<string, TextAccumulator>, event: DimSessionEvent["event"]) => {
     const delta = dimDelta(event.data);
@@ -462,26 +449,6 @@ export function buildDimThreadSnapshot(input: {
     }
     if (event.type === "step" && event.name === "thinking") {
       accumulate(reasoning, event);
-      continue;
-    }
-    if (event.type === "turn" && event.name === "start") {
-      const turnId = recordString(event.data, "turn_id");
-      if (turnId === undefined) continue;
-      turns.set(turnId, {
-        sequence: event.sequence,
-        startedAt: createdAtOf(event.create_at),
-        completedAt: null,
-        status: "running",
-      });
-      continue;
-    }
-    if (event.type === "turn" && event.name === "end") {
-      const end = dimTurnEnd(event.data);
-      if (end === null) continue;
-      const turn = turns.get(end.turnId);
-      if (turn === undefined) continue;
-      turn.completedAt = createdAtOf(event.create_at);
-      turn.status = end.status;
     }
   }
 
@@ -512,28 +479,7 @@ export function buildDimThreadSnapshot(input: {
   const messages = ordered.map((entry) => entry.message);
   const reasoningIds = ordered.filter((entry) => entry.reasoning).map((entry) => entry.message.id);
 
-  const providerTurns = [...turns.entries()]
-    .sort(([, a], [, b]) => a.sequence - b.sequence)
-    .map(([turnId, turn], index) => ({
-      id: input.ids.providerTurn(turnId),
-      providerThreadId: input.providerThread.id,
-      nodeId: input.ids.node(`turn:${turnId}`),
-      runAttemptId: null,
-      nativeTurnRef: { driver: input.driver, nativeId: turnId, strength: "strong" as const },
-      ordinal: index + 1,
-      status:
-        turn.status === "completed"
-          ? ("completed" as const)
-          : turn.status === "cancelled"
-            ? ("cancelled" as const)
-            : turn.status === "failed"
-              ? ("failed" as const)
-              : ("running" as const),
-      startedAt: turn.startedAt,
-      completedAt: turn.completedAt,
-    }));
-
-  return { messages, providerTurns, reasoningMessageIds: reasoningIds };
+  return { messages, reasoningMessageIds: reasoningIds };
 }
 
 /** The branch sequence of a turn's `turn/end`, the rest point `session.fork` accepts. */

@@ -1683,10 +1683,6 @@ describe("DimAdapter rollback", () => {
         snapshot.messages.map((message) => ({ role: message.role, text: message.text })),
         [{ role: "user", text: "first" }],
       );
-      assert.deepEqual(
-        snapshot.providerTurns.map((turn) => turn.nativeTurnRef?.nativeId),
-        ["turn-a"],
-      );
       assert.deepEqual(harness.fake.requestsOf("session.rename"), [
         { sessionId: SESSION_ID, title: "Kept title" },
         { sessionId: harness.fake.forkSessionId, title: "Kept title" },
@@ -1742,7 +1738,6 @@ describe("DimAdapter rollback", () => {
 
       assert.deepEqual(harness.fake.requestsOf("session.fork"), [{ sessionId: SESSION_ID, at: 0 }]);
       assert.deepEqual(snapshot.messages, []);
-      assert.deepEqual(snapshot.providerTurns, []);
       assert.isNull(snapshot.providerThread.nativeConversationHeadRef);
     }).pipe(Effect.scoped, Effect.provide(layers)),
   );
