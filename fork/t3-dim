@@ -379,6 +379,8 @@ write_plist() {
     <string>$_shell</string>
     <key>LANG</key>
     <string>$_lang</string>
+    <key>T3CODE_TELEMETRY_ENABLED</key>
+    <string>false</string>
   </dict>
   <key>StandardOutPath</key>
   <string>$_out</string>
