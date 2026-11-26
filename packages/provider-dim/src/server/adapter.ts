@@ -30,10 +30,12 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import {
@@ -207,6 +209,20 @@ export interface DimAdapterOptions {
   readonly instanceId: ProviderInstanceId;
   readonly connections: DimConnectionFactory;
   readonly modelContextWindows?: Ref.Ref<ReadonlyMap<string, number>>;
+  /** Turns Dim starts with no T3 turn open, such as a finished background command's wake, become runs here. */
+  readonly continuationRequests?: {
+    readonly offer: (
+      request: ProviderContinuationRequests.ProviderContinuationRequest,
+    ) => Effect.Effect<void>;
+  };
+}
+
+/** A turn Dim started on its own, held until T3 starts the run that shows it. */
+interface DimWake {
+  readonly sessionId: string;
+  readonly events: DimSessionEvent[];
+  /** Whether the last turn in `events` is still open in Dim. */
+  running: boolean;
 }
 
 interface ToolItemState {
@@ -479,6 +495,9 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
       >();
       const seenEventIds = new Set<string>();
       const seenOrder: string[] = [];
+      let pendingWake: DimWake | null = null;
+      // Replaying a wake into its run must not interleave with live events.
+      const eventPermit = yield* Semaphore.make(1);
 
       const updateSession = Effect.fn("DimAdapter.updateSession")(function* (
         status: OrchestrationV2ProviderSession["status"],
@@ -1043,13 +1062,49 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
         if (session === null) return;
         turn.stopSent = true;
         turn.pendingStopReason = null;
-        yield* connection
-          .request("session.stop", {
-            sessionId: session.sessionId,
-            branchId: DIM_BRANCH,
-            reason,
-          })
-          .pipe(Effect.ignore);
+        yield* connection.request("session.stop", {
+          sessionId: session.sessionId,
+          branchId: DIM_BRANCH,
+          reason,
+        });
+      });
+
+      /** Ends a held wake no run will show; the daemon would otherwise run it unseen. */
+      const dropWake = Effect.fn("DimAdapter.dropWake")(function* (wake: DimWake, reason: string) {
+        if (pendingWake !== wake) return;
+        pendingWake = null;
+        if (!wake.running) return;
+        yield* connection.request("session.stop", {
+          sessionId: wake.sessionId,
+          branchId: DIM_BRANCH,
+          reason,
+        });
+      });
+      const dropWakeQuietly = (wake: DimWake, reason: string) =>
+        dropWake(wake, reason).pipe(
+          Effect.catch((cause) => Effect.logWarning("Dim did not stop a dropped turn", { cause })),
+        );
+
+      // Dim wakes the session when a background command ends uncancelled, so a Stop cancels them.
+      const stopBackgroundTasks = Effect.fn("DimAdapter.stopBackgroundTasks")(function* () {
+        const session = threadState;
+        if (session === null) return;
+        yield* Effect.forEach(
+          [...backgroundTasks.keys()],
+          (taskId) =>
+            connection
+              .request("session.exec.stop", {
+                sessionId: session.sessionId,
+                branchId: DIM_BRANCH,
+                taskId,
+              })
+              .pipe(
+                Effect.catch((cause) =>
+                  Effect.logWarning("Dim did not stop a background task", { taskId, cause }),
+                ),
+              ),
+          { discard: true },
+        );
       });
 
       const updateBackgroundTasks = Effect.fn("DimAdapter.updateBackgroundTasks")(function* () {
@@ -1111,6 +1166,37 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
         yield* emitToolItem(turn, tool, tool.status === "running" ? null : yield* DateTime.now);
       });
 
+      const holdWake = Effect.fn("DimAdapter.holdWake")(function* (
+        event: DimSessionEvent,
+        name: string,
+      ) {
+        const isTurnStart = name === "turn/start";
+        if (pendingWake !== null) {
+          pendingWake.events.push(event);
+          if (isTurnStart) pendingWake.running = true;
+          if (name === "turn/end") pendingWake.running = false;
+          return;
+        }
+        const session = threadState;
+        const continuations = options.continuationRequests;
+        if (!isTurnStart || session === null || continuations === undefined || closed) return;
+        const wake: DimWake = { sessionId: session.sessionId, events: [event], running: true };
+        pendingWake = wake;
+        const drop = () => dropWakeQuietly(wake, "T3 will not show this turn");
+        yield* continuations.offer({
+          threadId: session.providerThread.appThreadId ?? input.threadId,
+          providerThreadId: session.providerThread.id,
+          driver: DIM_PROVIDER,
+          detail: null,
+          delivery: "adapter_buffered",
+          dispatchIfCurrent: (dispatch) =>
+            pendingWake === wake
+              ? Effect.asSome(dispatch).pipe(Effect.tapError(drop))
+              : Effect.succeedNone,
+          clearIfCurrent: drop,
+        });
+      });
+
       const handleEvent = Effect.fn("DimAdapter.handleEvent")(function* (event: DimSessionEvent) {
         let turn = activeTurn;
         if (!isRecord(event.event.data)) return;
@@ -1133,7 +1219,11 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           yield* updateBackgroundTasks();
           return;
         }
-        if (turn === null || threadState === null) return;
+        if (threadState === null) return;
+        if (turn === null) {
+          yield* holdWake(event, name);
+          return;
+        }
         const data = event.event.data;
         const eventTurnId = recordString(data, "turn_id");
         const turnScoped = name === "turn/start" || name === "turn/end" || name.startsWith("step/");
@@ -1204,7 +1294,11 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
             providerTurn: turn.providerTurn,
           });
           if (turn.pendingStopReason !== null) {
-            yield* sendStop(turn, turn.pendingStopReason);
+            yield* sendStop(turn, turn.pendingStopReason).pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning("Dim did not accept a deferred stop", { dimTurnId, cause }),
+              ),
+            );
           }
           return;
         }
@@ -1733,7 +1827,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           if (event === null) return;
           if (threadState !== null && event.sessionId !== threadState.sessionId) return;
           if (!rememberEvent(event.event.id)) return;
-          yield* handleEvent(event);
+          yield* eventPermit.withPermits(1)(handleEvent(event));
           return;
         }
         if (notice.method === "session.model.progress") {
@@ -1774,6 +1868,7 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
             sessionId !== threadState.sessionId
           )
             return;
+          pendingWake = null;
           if (activeTurn !== null) {
             yield* finalizeTurn({ status: "cancelled", reason: "session closed" });
           }
@@ -1950,14 +2045,19 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           closed = true;
           if (mcpRenew !== null) yield* Fiber.interrupt(mcpRenew);
           const turn = activeTurn;
-          const session = threadState;
           // The daemon outlives T3, so a T3-owned running turn must not keep going unseen.
-          if (turn !== null && turn.dimTurnId !== null && session !== null) {
+          const runningSessionId =
+            turn !== null && turn.dimTurnId !== null
+              ? threadState?.sessionId
+              : pendingWake?.running === true
+                ? pendingWake.sessionId
+                : undefined;
+          if (runningSessionId !== undefined) {
             yield* connection
               .request(
                 "session.stop",
                 {
-                  sessionId: session.sessionId,
+                  sessionId: runningSessionId,
                   branchId: DIM_BRANCH,
                   reason: "T3 closed the session",
                 },
@@ -2291,6 +2391,30 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
         return collected;
       });
 
+      /** Shows a turn Dim started on its own as this run; Dim already runs it, so nothing is submitted. */
+      const adoptWake = Effect.fn("DimAdapter.adoptWake")(function* (
+        turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+        session: ThreadState,
+      ) {
+        if (activeTurn !== null) {
+          return yield* protocolError("Dim provider thread already has an active turn");
+        }
+        // A fork or rollback moved the thread to another session, where the held turn never ends.
+        if (pendingWake !== null && pendingWake.sessionId !== session.sessionId) {
+          yield* dropWakeQuietly(pendingWake, "T3 moved to another session");
+        }
+        const wake = pendingWake;
+        pendingWake = null;
+        const turn = yield* installTurn(turnInput, session, false);
+        // A Stop or a closed session dropped the turn this run was to show.
+        if (wake === null) {
+          yield* finalizeTurn({ status: "cancelled", reason: null });
+          return;
+        }
+        turn.startApplied = true;
+        for (const event of wake.events) yield* handleEvent(event);
+      });
+
       const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
         instanceId: options.instanceId,
         driver: DIM_PROVIDER,
@@ -2300,7 +2424,9 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
         },
         events: Stream.fromQueue(events),
         canResumeAfterRestart: true,
-        hasPendingBackgroundWork: Effect.sync(() => backgroundTasks.size > 0),
+        hasPendingBackgroundWork: Effect.sync(
+          () => backgroundTasks.size > 0 || pendingWake !== null,
+        ),
         stopTask: Effect.fn("DimAdapter.stopTask")(function* (taskInput: {
           readonly providerThread: OrchestrationV2ProviderThread;
           readonly taskId: string;
@@ -2396,6 +2522,25 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           if (turnInput.providerThread.id !== session.providerThread.id) {
             return yield* protocolError("Dim turn requested for a different thread");
           }
+          if (
+            turnInput.message.createdBy === "agent" &&
+            turnInput.message.creationSource === "provider"
+          ) {
+            return yield* eventPermit
+              .withPermits(1)(adoptWake(turnInput, session))
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapter.ProviderAdapterTurnStartError({
+                      driver: DIM_PROVIDER,
+                      threadId: turnInput.threadId,
+                      providerThreadId: turnInput.providerThread.id,
+                      runId: turnInput.runId,
+                      cause,
+                    }),
+                ),
+              );
+          }
           const text = yield* providerMessageTextWithAttachmentPaths({
             text: yield* skillAwareText(turnInput.message.text),
             attachments: turnInput.message.attachments,
@@ -2417,6 +2562,8 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
           // A wider stored preset must be narrowed before this turn's first tool call.
           yield* ensurePreset(dimPreset(turnInput.runtimePolicy)).pipe(Effect.mapError(turnError));
           yield* applySelection(turnInput.modelSelection).pipe(Effect.mapError(turnError));
+          // This turn would queue behind a held wake that its run could then never show.
+          if (pendingWake !== null) yield* dropWakeQuietly(pendingWake, "T3 started another turn");
           const turn = yield* installTurn(turnInput, session, false);
           const submitted = yield* connection
             .request("session.submit", {
@@ -2531,15 +2678,33 @@ export const makeDimAdapterV2 = Effect.fn("DimAdapter.make")(function* (
         interruptTurn: Effect.fn("DimAdapter.interruptTurn")(function* (
           interruptInput: ProviderAdapter.ProviderAdapterV2InterruptInput,
         ) {
+          const reason = "User requested stop";
+          const failed = (cause: unknown) =>
+            new ProviderAdapter.ProviderAdapterInterruptError({
+              driver: DIM_PROVIDER,
+              providerThreadId: interruptInput.providerThread.id,
+              providerTurnId: interruptInput.providerTurnId,
+              cause,
+            });
+          // A user Stop ends the agent's background work too; an interrupt for a steer keeps it.
+          const stopsWork = interruptInput.requestRuntimeRestart === true;
           const turn = activeTurn;
+          if (turn === null && stopsWork) {
+            if (pendingWake !== null) {
+              yield* dropWake(pendingWake, reason).pipe(Effect.mapError(failed));
+            }
+            yield* stopBackgroundTasks();
+            return;
+          }
           if (turn === null || turn.providerTurn.id !== interruptInput.providerTurnId) {
             return yield* protocolError("Dim turn is not active");
           }
           if (turn.dimTurnId === null) {
-            turn.pendingStopReason = "User requested stop";
-            return;
+            turn.pendingStopReason = reason;
+          } else {
+            yield* sendStop(turn, reason).pipe(Effect.mapError(failed));
           }
-          yield* sendStop(turn, "User requested stop");
+          if (stopsWork) yield* stopBackgroundTasks();
         }),
         respondToRuntimeRequest: Effect.fn("DimAdapter.respondToRuntimeRequest")(function* (
           requestInput: ProviderAdapter.ProviderAdapterV2RuntimeRequestResponseInput,

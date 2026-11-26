@@ -26,6 +26,7 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
@@ -33,6 +34,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
@@ -98,6 +100,7 @@ class FakeDim {
   allowedTools: string[] = [];
   disallowedTools: string[] = [];
   failSubmit = false;
+  failStop = false;
   failModelUpdate = false;
   failPermissionUpdate = false;
   failFork = false;
@@ -283,6 +286,10 @@ class FakeDim {
           };
         }
         case "session.stop":
+          if (self.failStop) {
+            return yield* new DimTransportError({ detail: "stop failed" });
+          }
+          return {};
         case "session.detach":
         case "session.mcp_temporary.attach":
         case "session.mcp_temporary.renew":
@@ -379,12 +386,21 @@ const openHarness = (input?: {
   readonly runtimePolicy?: ReturnType<typeof runtimePolicy>;
   readonly modelSelection?: ModelSelection;
   readonly initialNativeThreadId?: string;
+  readonly continuations?: Array<ProviderContinuationRequests.ProviderContinuationRequest>;
 }) =>
   Effect.gen(function* () {
     const fake = yield* makeFakeDim;
+    const continuations = input?.continuations;
     const adapter = yield* makeDimAdapterV2({
       instanceId: INSTANCE_ID,
       connections: { connect: () => Effect.succeed(fake.connection) },
+      ...(continuations === undefined
+        ? {}
+        : {
+            continuationRequests: {
+              offer: (request) => Effect.sync(() => void continuations.push(request)),
+            },
+          }),
     });
     const runtime = yield* adapter.openSession({
       threadId: THREAD_ID,
@@ -1100,6 +1116,264 @@ describe("DimAdapter background work", () => {
       assert.deepEqual(harness.fake.requestsOf("session.exec.stop"), [
         { sessionId: SESSION_ID, branchId: "main", taskId: "task-1" },
       ]);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+});
+
+describe("DimAdapter stops and the turns Dim starts itself", () => {
+  type Harness = Effect.Success<ReturnType<typeof openHarness>>;
+
+  const startOurs = (harness: Harness) =>
+    Effect.gen(function* () {
+      const thread = yield* ensureThread(harness.runtime);
+      yield* harness.runtime.startTurn(turnInput(thread));
+      harness.fake.pushEvent("input", "applied", { input_id: "input-1", mode: "queue" });
+      harness.fake.pushEvent("turn", "start", { turn_id: "ours" });
+      const started = yield* harness.waitFor(
+        (event) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.nativeTurnRef?.nativeId === "ours",
+      );
+      assert.strictEqual(started.type, "provider_turn.updated");
+      const providerTurnId =
+        started.type === "provider_turn.updated" ? started.providerTurn.id : undefined;
+      return { thread, providerTurnId: providerTurnId! };
+    });
+
+  const startBackgroundTask = (harness: Harness, taskId: string) =>
+    Effect.gen(function* () {
+      harness.fake.pushEvent("exec", "started", {
+        turn_id: "ours",
+        request_id: "request-1",
+        call_id: `call-${taskId}`,
+        task_id: taskId,
+        title: "cargo check",
+      });
+      yield* harness.waitFor(
+        (event) =>
+          event.type === "provider_thread.updated" &&
+          (event.providerThread.pendingBackgroundTasks ?? []).some(
+            (task) => task.taskId === taskId,
+          ),
+      );
+    });
+
+  const endOurs = (harness: Harness, status: "completed" | "cancelled") =>
+    Effect.gen(function* () {
+      harness.fake.pushEvent("turn", "end", {
+        turn_id: "ours",
+        status,
+        reason: status === "completed" ? "end_turn" : "interrupted",
+      });
+      return yield* harness.waitFor(isTerminal);
+    });
+
+  /** What Dim does when a background command it ran finishes: post the result, then read it. */
+  const pushWake = (fake: FakeDim, text: string) => {
+    fake.pushEvent("input", "message", {
+      blocks: [{ type: "text", text: '<dim-notification source="exec">done</dim-notification>' }],
+      mode: "steer",
+    });
+    fake.pushEvent("turn", "start", { turn_id: "wake" });
+    fake.pushEvent("step", "text", { turn_id: "wake", request_id: "request-wake", delta: text });
+  };
+
+  /** Notices are handled in order, so once this one shows, every earlier one has been. */
+  const drain = (harness: Harness) =>
+    Effect.gen(function* () {
+      harness.fake.push({
+        method: "session.state",
+        params: { sessionId: SESSION_ID, branchId: "main", running: false, stopping: false },
+      });
+      yield* harness.waitFor(
+        (event) =>
+          event.type === "provider_session.updated" && event.providerSession.status === "ready",
+      );
+    });
+
+  const wakeTurnInput = (
+    providerThread: OrchestrationV2ProviderThread,
+  ): ProviderAdapter.ProviderAdapterV2TurnInput => ({
+    ...turnInput(providerThread),
+    runId: RunId.make("run-2"),
+    runOrdinal: 2,
+    providerTurnOrdinal: 2,
+    attemptId: RunAttemptId.make("attempt-2"),
+    message: {
+      messageId: MessageId.make("message-wake"),
+      text: "Background activity updated",
+      attachments: [],
+      createdBy: "agent",
+      creationSource: "provider",
+    },
+  });
+
+  it.effect("shows a turn Dim starts after an interrupt as T3's run, without resubmitting", () =>
+    Effect.gen(function* () {
+      const continuations: Array<ProviderContinuationRequests.ProviderContinuationRequest> = [];
+      const harness = yield* openHarness({ continuations });
+      const { thread, providerTurnId } = yield* startOurs(harness);
+      yield* harness.runtime.interruptTurn({ providerThread: thread, providerTurnId });
+      const interrupted = yield* endOurs(harness, "cancelled");
+      assert.strictEqual(
+        interrupted.type === "turn.terminal" ? interrupted.status : undefined,
+        "interrupted",
+      );
+
+      pushWake(harness.fake, "the build passed");
+      yield* drain(harness);
+      assert.strictEqual(continuations.length, 1);
+      const wake = continuations[0]!;
+      assert.strictEqual(wake.delivery, "adapter_buffered");
+      assert.strictEqual(wake.threadId, THREAD_ID);
+      assert.strictEqual(wake.providerThreadId, thread.id);
+      assert.isTrue(Option.isSome(yield* wake.dispatchIfCurrent!(Effect.void)));
+
+      yield* harness.runtime.startTurn(wakeTurnInput(thread));
+      harness.fake.pushEvent("step", "text", {
+        turn_id: "wake",
+        request_id: "request-wake",
+        delta: ", so I opened the PR",
+      });
+      harness.fake.pushEvent("turn", "end", {
+        turn_id: "wake",
+        status: "completed",
+        reason: "end_turn",
+      });
+      const ended = yield* harness.waitFor(isTerminal);
+      assert.strictEqual(ended.type === "turn.terminal" ? ended.status : undefined, "completed");
+
+      const seen = yield* Ref.get(harness.events);
+      const wakeTurn = seen.find(
+        (event) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.nativeTurnRef?.nativeId === "wake",
+      );
+      assert.isDefined(wakeTurn);
+      assert.strictEqual(
+        ended.type === "turn.terminal" ? ended.providerTurnId : undefined,
+        wakeTurn?.type === "provider_turn.updated" ? wakeTurn.providerTurn.id : undefined,
+      );
+      const replies = seen.flatMap((event) =>
+        event.type === "message.updated" && event.message.role === "assistant"
+          ? [event.message.text]
+          : [],
+      );
+      assert.strictEqual(replies.at(-1), "the build passed, so I opened the PR");
+      assert.strictEqual(harness.fake.requestsOf("session.submit").length, 1);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("a Stop stops the turn, then the background tasks that would wake Dim", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const { thread, providerTurnId } = yield* startOurs(harness);
+      yield* startBackgroundTask(harness, "task-1");
+      yield* harness.runtime.interruptTurn({
+        providerThread: thread,
+        providerTurnId,
+        requestRuntimeRestart: true,
+      });
+      assert.deepEqual(
+        harness.fake.requests
+          .filter(
+            (entry) => entry.method === "session.stop" || entry.method === "session.exec.stop",
+          )
+          .map((entry) => entry.method),
+        ["session.stop", "session.exec.stop"],
+      );
+      assert.deepEqual(harness.fake.requestsOf("session.exec.stop"), [
+        { sessionId: SESSION_ID, branchId: "main", taskId: "task-1" },
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("a Stop after the turn settled still stops its background tasks", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const { thread, providerTurnId } = yield* startOurs(harness);
+      yield* startBackgroundTask(harness, "task-1");
+      yield* endOurs(harness, "completed");
+      yield* harness.runtime.interruptTurn({
+        providerThread: thread,
+        providerTurnId,
+        requestRuntimeRestart: true,
+      });
+      assert.deepEqual(harness.fake.requestsOf("session.exec.stop"), [
+        { sessionId: SESSION_ID, branchId: "main", taskId: "task-1" },
+      ]);
+      assert.strictEqual(harness.fake.requestsOf("session.stop").length, 0);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("an interrupt that keeps the runtime leaves background tasks running", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const { thread, providerTurnId } = yield* startOurs(harness);
+      yield* startBackgroundTask(harness, "task-1");
+      yield* harness.runtime.interruptTurn({ providerThread: thread, providerTurnId });
+      assert.strictEqual(harness.fake.requestsOf("session.stop").length, 1);
+      assert.strictEqual(harness.fake.requestsOf("session.exec.stop").length, 0);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("a Stop stops and drops a turn Dim started that T3 has not shown yet", () =>
+    Effect.gen(function* () {
+      const continuations: Array<ProviderContinuationRequests.ProviderContinuationRequest> = [];
+      const harness = yield* openHarness({ continuations });
+      const { thread, providerTurnId } = yield* startOurs(harness);
+      yield* endOurs(harness, "completed");
+      pushWake(harness.fake, "reading the result");
+      yield* drain(harness);
+      assert.strictEqual(continuations.length, 1);
+
+      yield* harness.runtime.interruptTurn({
+        providerThread: thread,
+        providerTurnId,
+        requestRuntimeRestart: true,
+      });
+      assert.deepEqual(harness.fake.requestsOf("session.stop"), [
+        { sessionId: SESSION_ID, branchId: "main", reason: "User requested stop" },
+      ]);
+      assert.isTrue(Option.isNone(yield* continuations[0]!.dispatchIfCurrent!(Effect.void)));
+
+      // A run dispatched before the Stop has nothing left to show.
+      yield* harness.runtime.startTurn(wakeTurnInput(thread));
+      const ended = yield* harness.waitFor(isTerminal);
+      assert.strictEqual(ended.type === "turn.terminal" ? ended.status : undefined, "cancelled");
+      assert.strictEqual(harness.fake.requestsOf("session.submit").length, 1);
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("a stop Dim refuses fails the interrupt", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const { thread, providerTurnId } = yield* startOurs(harness);
+      harness.fake.failStop = true;
+      const failed = yield* harness.runtime
+        .interruptTurn({ providerThread: thread, providerTurnId, requestRuntimeRestart: true })
+        .pipe(Effect.flip);
+      assert.strictEqual(failed._tag, "ProviderAdapterInterruptError");
+    }).pipe(Effect.scoped, Effect.provide(layers)),
+  );
+
+  it.effect("a deferred stop Dim refuses leaves the session's events flowing", () =>
+    Effect.gen(function* () {
+      const harness = yield* openHarness();
+      const thread = yield* ensureThread(harness.runtime);
+      yield* harness.runtime.startTurn(turnInput(thread));
+      const started = yield* harness.waitFor((event) => event.type === "provider_turn.updated");
+      const providerTurnId =
+        started.type === "provider_turn.updated" ? started.providerTurn.id : undefined;
+      yield* harness.runtime.interruptTurn({
+        providerThread: thread,
+        providerTurnId: providerTurnId!,
+      });
+      harness.fake.failStop = true;
+      harness.fake.pushEvent("input", "applied", { input_id: "input-1", mode: "queue" });
+      harness.fake.pushEvent("turn", "start", { turn_id: "ours" });
+      yield* endOurs(harness, "cancelled");
+      assert.strictEqual(harness.fake.requestsOf("session.stop").length, 1);
     }).pipe(Effect.scoped, Effect.provide(layers)),
   );
 });

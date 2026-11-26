@@ -12,6 +12,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
@@ -133,6 +134,7 @@ export const DimDriver: ProviderDriver<DimSettings, DimDriverEnv> = {
       connections: {
         connect: ({ clientName }) => daemon.connect(clientName),
       },
+      continuationRequests: yield* ProviderContinuationRequests.ProviderContinuationRequests,
     });
     const continuationIdentity = defaultProviderContinuationIdentity({
       driverKind: DRIVER_KIND,
